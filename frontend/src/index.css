@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Noto Sans SC", system-ui, -apple-system, sans-serif;
+  line-height: 1.6;
+  color: #1a1a2e;
+  background-color: #f8f9fa;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+/* 文本阅读样式 */
+.prose {
+  max-width: 65ch;
+  line-height: 1.8;
+}
+.prose p {
+  margin-bottom: 1.2em;
+  text-indent: 2em;
+}
