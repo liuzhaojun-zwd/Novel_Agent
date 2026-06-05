@@ -25,3 +25,11 @@ Thumbs.db
 backend/data/
 backend/structure.txt
 *.log
+
+# 文档 — 只保留 README.md
+ARCHITECTURE.md
+IMPROVEMENTS.md
+REQUIREMENTS.md
+TASKS.md
+backend/requirements.txt
+frontend/README.md
