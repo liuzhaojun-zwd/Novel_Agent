@@ -1,24 +1,46 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { api } from "../api";
 
 export default function OutlineView({ jobId, onConfirm, outline: initialOutline, onBack }) {
   const [outline, setOutline] = useState(initialOutline || []);
+  const [generating, setGenerating] = useState(false);
   const [loading, setLoading] = useState(false);
   const [modifyInstr, setModifyInstr] = useState("");
   const [modifyMsg, setModifyMsg] = useState("");
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    if (!initialOutline && jobId) {
+    mountedRef.current = true;
+    if (!initialOutline && jobId && !generating) {
       loadOutline();
     }
+    return () => { mountedRef.current = false; };
   }, [jobId]);
 
   const loadOutline = async () => {
+    if (generating) return;
+    setGenerating(true);
+    setModifyMsg("");
     try {
       const data = await api.generateOutline(jobId);
-      setOutline(data.outline);
+      if (mountedRef.current) {
+        setOutline(data.outline);
+        setModifyMsg("✅ 大纲生成成功");
+      }
     } catch (err) {
-      setModifyMsg("大纲生成失败: " + err.message);
+      if (mountedRef.current) {
+        // 如果是因为正在生成中，稍等后自动重试一次
+        if (err.message.includes("不允许")) {
+          setModifyMsg("大纲正在生成中，请稍候...");
+          setTimeout(() => {
+            if (mountedRef.current && !outline.length) loadOutline();
+          }, 8000);
+        } else {
+          setModifyMsg("❌ " + err.message);
+        }
+      }
+    } finally {
+      if (mountedRef.current) setGenerating(false);
     }
   };
 
@@ -69,13 +91,14 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
         <div className="flex gap-2">
           <button
             onClick={loadOutline}
-            className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer"
+            disabled={generating}
+            className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
-            🔄 重新生成
+            {generating ? "⏳ 生成中..." : "🔄 重新生成"}
           </button>
           <button
             onClick={handleConfirm}
-            disabled={loading}
+            disabled={loading || generating || outline.length === 0}
             className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm rounded-lg font-medium transition cursor-pointer"
           >
             {loading ? "处理中..." : "✅ 确认大纲，开始写正文"}

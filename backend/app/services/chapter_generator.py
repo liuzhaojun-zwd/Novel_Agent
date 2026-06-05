@@ -91,6 +91,11 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
     )
 
     await svc.update_job_status(job_id, "generating_chapters")
+    # 立即推送初始进度，让前端第一时间感知到生成已启动
+    await publish(job_id, "progress",
+                  chapter=0, total=setup.chapter_count,
+                  status="generating_chapters",
+                  message=f"准备开始写作（共{setup.chapter_count}章）")
 
     chapters = await svc.get_job_chapters(job_id)
     llm = LLMAdapter()

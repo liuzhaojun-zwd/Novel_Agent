@@ -11,6 +11,7 @@ export default function ProgressPanel({ jobId, onBack }) {
   const [readingChapter, setReadingChapter] = useState(null);
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState("");
+  const [starting, setStarting] = useState(false);
 
   // 加载任务数据
   const loadJob = async () => {
@@ -39,7 +40,9 @@ export default function ProgressPanel({ jobId, onBack }) {
     const map = {
       pending: "等待中",
       generating_outline: "正在生成大纲...",
-      generating_chapters: `写作中 (已完成 ${cur}/${total} 章)`,
+      generating_chapters: cur === 0
+        ? `准备中 (共${total}章，首次生成较慢请耐心等待)`
+        : `写作中 (已完成 ${cur}/${total} 章)`,
       paused: `已暂停 (已完成 ${cur} 章)`,
       completed: "✅ 已完成",
       failed: "❌ 生成失败",
@@ -51,7 +54,11 @@ export default function ProgressPanel({ jobId, onBack }) {
   useSSE(jobId, (event, data) => {
     if (event === "progress") {
       setCurrentChapter(data.chapter);
-      setStatusText(`写作中 (已完成 ${data.chapter}/${data.total} 章)`);
+      setStatusText(
+        data.chapter === 0
+          ? `准备中 (共${data.total}章，正在调用AI生成...)`
+          : `写作中 (已完成 ${data.chapter}/${data.total} 章)`
+      );
       loadChapters();
     } else if (event === "chapter_complete") {
       loadChapters();
@@ -70,18 +77,33 @@ export default function ProgressPanel({ jobId, onBack }) {
   });
 
   const handleStart = async (upTo) => {
+    if (starting) return;
+    setStarting(true);
+    setStatusText("");
     try {
       await api.startGeneration(jobId, upTo);
+      // 立即更新状态显示
+      await loadJob();
+      await loadChapters();
     } catch (e) {
       setStatusText("启动失败: " + e.message);
+    } finally {
+      setStarting(false);
     }
   };
 
   const handleResume = async (upTo) => {
+    if (starting) return;
+    setStarting(true);
+    setStatusText("");
     try {
       await api.resumeGeneration(jobId, upTo);
+      await loadJob();
+      await loadChapters();
     } catch (e) {
       setStatusText("续生失败: " + e.message);
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -157,14 +179,14 @@ export default function ProgressPanel({ jobId, onBack }) {
         {/* 首次启动：可指定写几章 */}
         {job.status === "pending" && job.outline && (
           <div className="flex flex-wrap items-center gap-2">
-            <button onClick={() => handleStart(totalChapters < 5 ? totalChapters : 5)} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              ▶️ 写5章
+            <button onClick={() => handleStart(totalChapters < 5 ? totalChapters : 5)} disabled={starting} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳ 启动中..." : "▶️ 写5章"}
             </button>
-            <button onClick={() => handleStart(totalChapters < 10 ? totalChapters : 10)} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              ▶️ 写10章
+            <button onClick={() => handleStart(totalChapters < 10 ? totalChapters : 10)} disabled={starting} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳ 启动中..." : "▶️ 写10章"}
             </button>
-            <button onClick={() => handleStart()} className="px-4 py-2 bg-indigo-700 hover:bg-indigo-800 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              ▶️ 全部({totalChapters}章)
+            <button onClick={() => handleStart()} disabled={starting} className="px-4 py-2 bg-indigo-700 hover:bg-indigo-800 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳ 启动中..." : `▶️ 全部(${totalChapters}章)`}
             </button>
           </div>
         )}
@@ -173,14 +195,14 @@ export default function ProgressPanel({ jobId, onBack }) {
         {job.status === "paused" && (
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm text-gray-500 mr-1">续写:</span>
-            <button onClick={() => handleResume(completedChapters + 5 > totalChapters ? totalChapters : completedChapters + 5)} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              5章
+            <button onClick={() => handleResume(completedChapters + 5 > totalChapters ? totalChapters : completedChapters + 5)} disabled={starting} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳" : "5章"}
             </button>
-            <button onClick={() => handleResume(completedChapters + 10 > totalChapters ? totalChapters : completedChapters + 10)} className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              10章
+            <button onClick={() => handleResume(completedChapters + 10 > totalChapters ? totalChapters : completedChapters + 10)} disabled={starting} className="px-4 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳" : "10章"}
             </button>
-            <button onClick={() => handleResume()} className="px-4 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded-lg text-sm font-medium transition cursor-pointer">
-              全部(剩余{totalChapters - completedChapters}章)
+            <button onClick={() => handleResume()} disabled={starting} className="px-4 py-2 bg-amber-700 hover:bg-amber-800 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
+              {starting ? "⏳" : `全部(剩余${totalChapters - completedChapters}章)`}
             </button>
           </div>
         )}
