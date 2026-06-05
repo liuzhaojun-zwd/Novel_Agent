@@ -79,6 +79,7 @@ class LLMAdapter:
         self,
         messages: list[dict],
         max_tokens: int = 8192,
+        response_format: Optional[dict] = None,
     ) -> AsyncGenerator[str, None]:
         """调用 LLM 并流式返回 token 片段。
         
@@ -97,6 +98,8 @@ class LLMAdapter:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if response_format:
+            body["response_format"] = response_format
 
         prompt_preview = messages[-1]["content"][:80] if messages else ""
 

@@ -60,16 +60,25 @@ async def _run_outline_generation(job_id: str, job):
 
         outline = await generate_outline_stream(setup, job_id, sse_publish)
 
+        if not outline:
+            raise RuntimeError("生成的大纲为空")
+
         # 保存
         await svc.save_outline(job_id, outline)
         logger.info(f"大纲生成完成: job={job_id[:8]} {len(outline)}章")
 
-    except Exception as e:
-        logger.error(f"大纲生成失败: job={job_id[:8]} error={e}", exc_info=True)
+    except RuntimeError as e:
+        logger.error(f"大纲生成业务错误: job={job_id[:8]} error={e}")
         await svc.update_job_status(job_id, "pending")
         await publish(job_id, "outline_error",
                       error=str(e),
-                      message="大纲生成失败")
+                      message=f"大纲生成失败: {e}")
+    except Exception as e:
+        logger.error(f"大纲生成系统异常: job={job_id[:8]} error={e}", exc_info=True)
+        await svc.update_job_status(job_id, "pending")
+        await publish(job_id, "outline_error",
+                      error=str(e),
+                      message=f"大纲生成失败（系统异常）")
 
 
 @router.get("/outline")
