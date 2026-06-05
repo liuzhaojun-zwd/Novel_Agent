@@ -62,6 +62,7 @@ async def init_db():
                 current_chapter INTEGER NOT NULL DEFAULT 0,
                 fail_count INTEGER NOT NULL DEFAULT 0,
                 consistency_alerts TEXT DEFAULT '[]',
+                feedback TEXT DEFAULT '[]',
                 created_at TIMESTAMP NOT NULL DEFAULT (datetime('now','localtime')),
                 updated_at TIMESTAMP NOT NULL DEFAULT (datetime('now','localtime')),
                 completed_at TIMESTAMP
@@ -83,3 +84,11 @@ async def init_db():
                 UNIQUE(job_id, chapter_number)
             );
         """)
+        # 迁移：为已有数据库添加新列（幂等）
+        for col_sql in [
+            "ALTER TABLE jobs ADD COLUMN feedback TEXT DEFAULT '[]'",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass

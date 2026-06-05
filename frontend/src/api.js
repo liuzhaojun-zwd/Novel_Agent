@@ -76,4 +76,13 @@ export const api = {
     request("/api/settings/llm", { method: "PUT", body: JSON.stringify(config) }),
 
   checkSetupStatus: () => request("/api/settings/status"),
+
+  // Issue 11: 导出/导入设定
+  exportSetup: (id) => request(`/api/jobs/${id}/setup`),
+
+  // Issue 12: 写作反馈
+  getFeedback: (id) => request(`/api/jobs/${id}/feedback`),
+
+  saveFeedback: (id, feedback) =>
+    request(`/api/jobs/${id}/feedback`, { method: "PUT", body: JSON.stringify(feedback) }),
 };

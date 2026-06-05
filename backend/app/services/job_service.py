@@ -142,6 +142,11 @@ def _row_to_job_response(row) -> JobResponse:
     outline = json.loads(outline_raw) if outline_raw else None
     alerts_raw = row["consistency_alerts"]
     alerts = json.loads(alerts_raw) if alerts_raw else []
+    feedback_raw = row["feedback"]
+    try:
+        feedback = json.loads(feedback_raw) if feedback_raw else []
+    except (json.JSONDecodeError, TypeError):
+        feedback = []
 
     return JobResponse(
         id=row["id"],
@@ -158,6 +163,7 @@ def _row_to_job_response(row) -> JobResponse:
         current_chapter=row["current_chapter"],
         fail_count=row["fail_count"],
         consistency_alerts=[ConsistencyAlert(**a) for a in alerts],
+        feedback=feedback,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],

@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { api } from "../api";
 import { useSSE } from "../hooks/useSSE";
+import { ChapterSkeleton } from "./LoadingSkeleton";
 
 export default function ProgressPanel({ jobId, onBack }) {
   const [job, setJob] = useState(null);
@@ -27,6 +28,17 @@ export default function ProgressPanel({ jobId, onBack }) {
   const [editInstruction, setEditInstruction] = useState("");
   const [regenerating, setRegenerating] = useState(false);
 
+  // Issue 9: 滚动位置记忆
+  const viewerRef = useRef(null);
+  const scrollPositions = useRef({});
+  const chapterContentLoaded = useRef(false);
+
+  // Issue 12: 写作反馈
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackSaving, setFeedbackSaving] = useState(false);
+  const [feedbackList, setFeedbackList] = useState([]);
+  const [showFeedback, setShowFeedback] = useState(false);
+
   // 加载任务数据
   const loadJob = async () => {
     try {
@@ -48,7 +60,15 @@ export default function ProgressPanel({ jobId, onBack }) {
   useEffect(() => {
     loadJob();
     loadChapters();
+    loadFeedback();
   }, [jobId]);
+
+  const loadFeedback = async () => {
+    try {
+      const res = await api.getFeedback(jobId);
+      if (res?.feedback) setFeedbackList(res.feedback);
+    } catch (_) {}
+  };
 
   const updateStatusText = (st, cur, total) => {
     const map = {
@@ -161,6 +181,40 @@ export default function ProgressPanel({ jobId, onBack }) {
       loadJob();
     }
   });
+
+  // Issue 9: 滚动位置记忆
+  useEffect(() => {
+    if (readingChapter && viewerRef.current) {
+      const saved = scrollPositions.current[readingChapter.chapter_number];
+      if (saved !== undefined && !chapterContentLoaded.current) {
+        viewerRef.current.scrollTop = saved;
+      }
+      chapterContentLoaded.current = true;
+    }
+  }, [readingChapter]);
+
+  // Issue 12: 提交反馈
+  const handleSaveFeedback = async () => {
+    if (!feedbackText.trim()) return;
+    setFeedbackSaving(true);
+    const newFeedback = {
+      chapter: readingChapter?.chapter_number || 0,
+      text: feedbackText.trim(),
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      const updatedList = [...feedbackList, newFeedback];
+      await api.saveFeedback(jobId, updatedList);
+      setFeedbackList(updatedList);
+      setFeedbackText("");
+      setExportMsg("✅ 反馈已保存，将在后续章节生成中参考");
+      setTimeout(() => setExportMsg(""), 4000);
+    } catch (e) {
+      setExportMsg("反馈保存失败: " + e.message);
+    } finally {
+      setFeedbackSaving(false);
+    }
+  };
 
   const handleStart = async (upTo) => {
     if (starting) return;
@@ -376,7 +430,15 @@ export default function ProgressPanel({ jobId, onBack }) {
               return (
                 <button
                   key={ch.chapter_number}
-                  onClick={() => { setReadingChapter(ch); exitEditMode(); }}
+                  onClick={() => {
+                    // Issue 9: 保存当前滚动位置
+                    if (readingChapter && viewerRef.current) {
+                      scrollPositions.current[readingChapter.chapter_number] = viewerRef.current.scrollTop;
+                    }
+                    chapterContentLoaded.current = false;
+                    setReadingChapter(ch);
+                    exitEditMode();
+                  }}
                   className={`w-full text-left p-3 rounded-lg border transition cursor-pointer ${
                     ch.status === "completed"
                       ? "border-green-200 bg-green-50 hover:bg-green-100"
@@ -426,11 +488,56 @@ export default function ProgressPanel({ jobId, onBack }) {
                   </button>
                 )}
               </div>
-              <div className="prose text-gray-700 leading-relaxed whitespace-pre-wrap">
+              <div className="prose text-gray-700 leading-relaxed whitespace-pre-wrap" ref={viewerRef}>
                 {readingChapter.content || (
                   <span className="text-gray-300 italic">正文生成中...</span>
                 )}
               </div>
+
+              {/* Issue 12: 写作反馈 */}
+              {readingChapter.status === "completed" && (
+                <div className="mt-6 pt-4 border-t border-gray-100">
+                  <button
+                    onClick={() => setShowFeedback(!showFeedback)}
+                    className="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 cursor-pointer transition"
+                  >
+                    {showFeedback ? "▼" : "▶"} 写作反馈 ({feedbackList.length})
+                  </button>
+                  {showFeedback && (
+                    <div className="mt-3 space-y-3">
+                      {/* 已有反馈列表 */}
+                      {feedbackList.length > 0 && (
+                        <div className="space-y-1.5 max-h-32 overflow-y-auto">
+                          {feedbackList.map((fb, i) => (
+                            <div key={i} className="text-xs text-gray-500 bg-gray-50 rounded-lg px-3 py-2">
+                              <span className="text-gray-400">第{fb.chapter}章 · </span>
+                              {fb.text}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {/* 新反馈输入 */}
+                      <div className="flex gap-2">
+                        <input
+                          value={feedbackText}
+                          onChange={(e) => setFeedbackText(e.target.value)}
+                          placeholder="如：节奏再快一点、多一些对话、加入更多细节描写"
+                          className="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+                          onKeyDown={(e) => { if (e.key === "Enter") handleSaveFeedback(); }}
+                        />
+                        <button
+                          onClick={handleSaveFeedback}
+                          disabled={feedbackSaving || !feedbackText.trim()}
+                          className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm rounded-lg transition cursor-pointer disabled:cursor-not-allowed"
+                        >
+                          发送
+                        </button>
+                      </div>
+                      <p className="text-xs text-gray-400">反馈将在后续章节生成时自动参考</p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ) : (
             <div className="bg-gray-50 rounded-xl p-12 text-center text-gray-400 border border-dashed border-gray-200">

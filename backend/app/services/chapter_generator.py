@@ -6,6 +6,7 @@
 - Issue 7: 支持指定章节重新生成
 - Issue 8: 写作质量评估
 """
+from typing import Optional
 
 from app.services.llm_adapter import LLMAdapter
 from app.services import job_service as svc
@@ -13,6 +14,7 @@ from app.services.progress_tracker import publish
 from app.services.consistency_checker import check_consistency
 from app.services.quality_scorer import score_chapter, score_summary
 from app.services.context_manager import select_context_summaries
+from app.services.llm_cache import get_cached, set_cache, clear_cache
 from app.models import SetupCreate
 
 # 分段生成：每段目标 ~500 字
@@ -33,6 +35,7 @@ CHAPTER_PROMPT_TEMPLATE = """你是一位专业小说作家，请根据以下设
 
 ## 前文回顾
 {previous_summary}
+{user_feedback}
 
 ## 要求
 1. 创作正文内容，达到目标字数
@@ -56,6 +59,7 @@ def build_chapter_prompt(
     title: str,
     summary: str,
     previous_chapters_summary: str,
+    user_feedback: Optional[str] = None,
 ) -> str:
     optional_lines = []
     if setup.writing_style:
@@ -75,6 +79,14 @@ def build_chapter_prompt(
     else:
         previous_summary = previous_chapters_summary
 
+    # Issue 12: 用户反馈
+    if user_feedback:
+        feedback_section = (
+            f"\n## 用户反馈\n请参考以下用户的写作反馈进行调整：\n{user_feedback}\n"
+        )
+    else:
+        feedback_section = ""
+
     return CHAPTER_PROMPT_TEMPLATE.format(
         theme=setup.theme,
         topic=setup.topic,
@@ -84,6 +96,7 @@ def build_chapter_prompt(
         summary=summary,
         target_words=setup.words_per_chapter,
         previous_summary=previous_summary,
+        user_feedback=feedback_section,
     )
 
 
@@ -93,6 +106,7 @@ async def _generate_single_chapter(
     setup: SetupCreate,
     ch: dict,
     previous_summary_parts: list,
+    user_feedback: Optional[str] = None,
 ) -> tuple[bool, str, int]:
     """生成单个章节（支持分段 checkpoint）。
     
@@ -106,6 +120,7 @@ async def _generate_single_chapter(
 
     main_prompt = build_chapter_prompt(
         setup, chapter_num, ch["title"], ch["summary"], context_summary,
+        user_feedback=user_feedback,
     )
 
     full_content = ""
@@ -227,6 +242,19 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
     # 跨章节人物跟踪
     characters_seen_overall = {}
     chapter_scores = []
+    # Issue 12: 加载用户反馈
+    user_feedback_str = None
+    try:
+        fb = job.feedback or []
+        if fb:
+            fb_texts = []
+            for f in fb:
+                if isinstance(f, dict) and f.get("text"):
+                    fb_texts.append(f["text"])
+            if fb_texts:
+                user_feedback_str = "\n".join(f"- {t}" for t in fb_texts[-3:])  # 最近3条
+    except Exception:
+        pass
 
     for ch in chapters:
         if ch["status"] == "completed":
@@ -289,6 +317,7 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
             # 正常分段生成
             success, full_content, char_count = await _generate_single_chapter(
                 llm, job_id, setup, ch, previous_summary_parts,
+                user_feedback=user_feedback_str,
             )
 
         char_count = len(full_content.replace(" ", "").replace("\n", ""))
@@ -304,6 +333,7 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
             # 重新全文生成（覆盖已有内容）
             success, full_content, char_count = await _generate_single_chapter(
                 llm, job_id, setup, ch, previous_summary_parts,
+                user_feedback=user_feedback_str,
             )
             char_count = len(full_content.replace(" ", "").replace("\n", ""))
 

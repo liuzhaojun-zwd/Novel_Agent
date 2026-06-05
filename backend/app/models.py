@@ -62,6 +62,7 @@ class JobResponse(BaseModel):
     current_chapter: int = 0
     fail_count: int = 0
     consistency_alerts: list[ConsistencyAlert] = []
+    feedback: list[dict] = []
     created_at: str
     updated_at: str
     completed_at: Optional[str] = None

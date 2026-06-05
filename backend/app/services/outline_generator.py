@@ -1,5 +1,7 @@
-"""Novel_Agent — 大纲生成器"""
+"""Novel_Agent — 大纲生成器（支持 LLM 缓存）"""
 from app.services.llm_adapter import LLMAdapter
+from app.services.llm_cache import get_cached, set_cache
+from app.config import get_llm_config
 from app.models import SetupCreate
 
 
@@ -51,9 +53,20 @@ def build_outline_prompt(setup: SetupCreate) -> str:
 
 
 async def generate_outline(setup: SetupCreate) -> list[dict]:
-    """生成大纲，返回章节列表"""
+    """生成大纲，返回章节列表（使用 LLM 缓存）"""
     llm = LLMAdapter()
     prompt = build_outline_prompt(setup)
+    full_prompt = prompt  # 系统+用户消息合并用于缓存key
+
+    # Issue 10: 尝试从缓存读取
+    cfg = get_llm_config()
+    cached = get_cached(full_prompt, cfg["model"])
+    if cached:
+        import json
+        chapters = json.loads(cached)
+        if len(chapters) == setup.chapter_count:
+            return chapters
+
     messages = [
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。"},
         {"role": "user", "content": prompt},
@@ -62,6 +75,9 @@ async def generate_outline(setup: SetupCreate) -> list[dict]:
     chapters = result.get("chapters", [])
     # 确保数量正确
     if len(chapters) != setup.chapter_count:
-        # 裁剪或补全
         chapters = chapters[:setup.chapter_count]
+    else:
+        # 缓存完整结果
+        import json
+        set_cache(full_prompt, cfg["model"], json.dumps(chapters, ensure_ascii=False))
     return chapters
