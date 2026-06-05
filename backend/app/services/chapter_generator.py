@@ -3,6 +3,7 @@ from app.services.llm_adapter import LLMAdapter
 from app.services import job_service as svc
 from app.services.progress_tracker import publish
 from app.services.consistency_checker import check_consistency
+from app.services.context_manager import select_context_summaries, estimate_tokens
 from app.models import SetupCreate
 
 CHAPTER_PROMPT_TEMPLATE = """你是一位专业小说作家，请根据以下设定和章节大纲，创作一篇小说的章节正文。
@@ -69,11 +70,11 @@ def build_chapter_prompt(
 
 async def generate_chapters(job_id: str, up_to: int | None = None):
     """
-    逐章生成正文（后台任务）。
+    逐章生成正文（后台任务），支持流式输出。
 
     Args:
         job_id: 任务 ID
-        up_to: 可选，最多生成到第几章。不传或为 None 则生成全部章节。
+        up_to: 可选，最多生成到第几章。不传则为 None 则生成全部章节。
     """
     job = await svc.get_job(job_id)
     if not job:
@@ -91,7 +92,6 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
     )
 
     await svc.update_job_status(job_id, "generating_chapters")
-    # 立即推送初始进度，让前端第一时间感知到生成已启动
     await publish(job_id, "progress",
                   chapter=0, total=setup.chapter_count,
                   status="generating_chapters",
@@ -105,7 +105,9 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
 
     for ch in chapters:
         if ch["status"] == "completed":
-            previous_summary_parts.append(f"第{ch['chapter_number']}章（{ch['title']}）：{ch['summary']}")
+            previous_summary_parts.append(
+                f"第{ch['chapter_number']}章（{ch['title']}）：{ch['summary']}"
+            )
             continue
 
         chapter_num = ch["chapter_number"]
@@ -127,10 +129,13 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
                       status="generating_chapters",
                       message=f"正在写第 {chapter_num}/{job.chapter_count} 章")
 
-        previous_summary = "\n".join(previous_summary_parts[-5:]) if previous_summary_parts else ""
+        # --- 上下文窗口动态管理 ---
+        # 自动选择合适的摘要数量，避免超出上下文预算
+        selected_summaries = select_context_summaries(previous_summary_parts)
+        context_summary = "\n".join(selected_summaries)
 
         prompt = build_chapter_prompt(
-            setup, chapter_num, ch["title"], ch["summary"], previous_summary,
+            setup, chapter_num, ch["title"], ch["summary"], context_summary,
         )
 
         retry_count = 0
@@ -143,17 +148,36 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
                     {"role": "system", "content": "你是一位专业小说作家，擅长创作引人入胜的故事。"},
                     {"role": "user", "content": prompt},
                 ]
-                content = await llm.chat(messages)
+
+                # 流式输出：一边接收 LLM 返回的 token，一边推送 SSE
+                # 同时累积完整内容
+                content_chunks = []
+                accumulated = ""
+                async for chunk in llm.chat_stream(messages):
+                    content_chunks.append(chunk)
+                    accumulated += chunk
+                    # 每收到一段 token 就推送 SSE，前端实时显示
+                    await publish(job_id, "token",
+                                  chapter=chapter_num,
+                                  text=chunk,
+                                  accumulated=accumulated)
+
+                content = "".join(content_chunks)
 
                 # 字数校验
                 word_count = len(content.replace(" ", "").replace("\n", ""))
                 if word_count < setup.words_per_chapter * 0.5:
                     retry_count += 1
                     if retry_count < 3:
+                        await publish(job_id, "progress",
+                                      chapter=chapter_num,
+                                      total=job.chapter_count,
+                                      status="generating_chapters",
+                                      message=f"第 {chapter_num} 章字数不足（{word_count}/{setup.words_per_chapter}），正在重新生成...")
                         continue
-                    pass
 
                 success = True
+
             except Exception as e:
                 retry_count += 1
                 await publish(job_id, "error",

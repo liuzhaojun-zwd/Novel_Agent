@@ -13,6 +13,10 @@ export default function ProgressPanel({ jobId, onBack }) {
   const [exportMsg, setExportMsg] = useState("");
   const [starting, setStarting] = useState(false);
 
+  // 流式实时预览
+  const [liveText, setLiveText] = useState("");
+  const [liveChapterNum, setLiveChapterNum] = useState(0);
+
   // 加载任务数据
   const loadJob = async () => {
     try {
@@ -60,15 +64,26 @@ export default function ProgressPanel({ jobId, onBack }) {
           : `写作中 (已完成 ${data.chapter}/${data.total} 章)`
       );
       loadChapters();
+    } else if (event === "token") {
+      // 流式实时文本更新
+      setLiveChapterNum(data.chapter);
+      setLiveText(data.accumulated);
     } else if (event === "chapter_complete") {
+      // 章节完成时清空实时预览
+      setLiveText("");
+      setLiveChapterNum(0);
       loadChapters();
       loadJob();
     } else if (event === "batch_complete") {
+      setLiveText("");
+      setLiveChapterNum(0);
       setCurrentChapter(data.chapter);
       setStatusText(`已暂停 (已完成 ${data.chapter} 章)`);
       loadChapters();
       loadJob();
     } else if (event === "job_complete") {
+      setLiveText("");
+      setLiveChapterNum(0);
       loadJob();
       loadChapters();
     } else if (event === "error") {
@@ -82,7 +97,6 @@ export default function ProgressPanel({ jobId, onBack }) {
     setStatusText("");
     try {
       await api.startGeneration(jobId, upTo);
-      // 立即更新状态显示
       await loadJob();
       await loadChapters();
     } catch (e) {
@@ -112,7 +126,6 @@ export default function ProgressPanel({ jobId, onBack }) {
     setExportMsg("");
     try {
       const url = api.getExportUrl(jobId, fmt);
-      // 创建下载链接
       const a = document.createElement("a");
       a.href = url;
       a.download = "";
@@ -130,6 +143,7 @@ export default function ProgressPanel({ jobId, onBack }) {
   const totalChapters = job?.chapter_count || 0;
   const completedChapters = chapters.filter((c) => c.status === "completed").length;
   const progressPct = totalChapters > 0 ? Math.round((completedChapters / totalChapters) * 100) : 0;
+  const isGenerating = job?.status === "generating_chapters";
 
   if (!job) return <div className="text-center py-12 text-gray-400">加载中...</div>;
 
@@ -223,7 +237,24 @@ export default function ProgressPanel({ jobId, onBack }) {
       </div>
       {exportMsg && <p className="text-sm text-gray-600 mb-4">{exportMsg}</p>}
 
-      {/* 章节列表 */}
+      {/* 流式实时预览 */}
+      {isGenerating && liveText && (
+        <div className="bg-white rounded-xl p-6 shadow-sm border border-blue-100 mb-6">
+          <h3 className="text-sm font-semibold text-blue-600 mb-3">
+            ✍️ 实时写作 — 第 {liveChapterNum} 章
+            <span className="ml-2 text-blue-400 font-normal text-xs animate-pulse">写作中...</span>
+          </h3>
+          <div className="prose text-gray-700 leading-relaxed whitespace-pre-wrap max-h-96 overflow-y-auto text-sm bg-gray-50 rounded-lg p-4">
+            {liveText}
+            <span className="inline-block w-0.5 h-4 bg-blue-500 ml-0.5 animate-pulse" />
+          </div>
+          <p className="text-xs text-gray-400 mt-2">
+            约 {liveText.replace(/[\s\n]/g, "").length} 字 · 实时生成中
+          </p>
+        </div>
+      )}
+
+      {/* 章节列表 + 正文 */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-1">
           <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
@@ -274,6 +305,9 @@ export default function ProgressPanel({ jobId, onBack }) {
             <div className="bg-gray-50 rounded-xl p-12 text-center text-gray-400 border border-dashed border-gray-200">
               <div className="text-4xl mb-2">📖</div>
               <p>点击左侧章节查看正文</p>
+              {isGenerating && !liveText && (
+                <p className="text-xs mt-2 text-blue-400">AI 正在准备中，稍后实时文字会显示在这里...</p>
+              )}
             </div>
           )}
         </div>

@@ -103,16 +103,12 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
 
     # 同时更新 chapters 表中的标题和摘要
     from app.database import get_db
-    db = await get_db()
-    try:
+    async with get_db() as db:
         for ch in outline:
             await db.execute(
                 "UPDATE chapters SET title = ?, summary = ? WHERE job_id = ? AND chapter_number = ?",
                 (ch["title"], ch["summary"], job_id, ch["chapter_number"]),
             )
-        await db.commit()
-    finally:
-        await db.close()
 
     return {"outline": outline, "message": "大纲已更新"}
 

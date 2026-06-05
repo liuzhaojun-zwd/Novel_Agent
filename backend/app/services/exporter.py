@@ -9,8 +9,7 @@ async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
     导出任务作品。
     返回 (文件路径, 文件名, mime_type)
     """
-    db = await get_db()
-    try:
+    async with get_db() as db:
         cursor = await db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
         job = await cursor.fetchone()
         if not job:
@@ -32,8 +31,6 @@ async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
         filepath = str(DATA_DIR / filename)
         Path(filepath).write_text(content, encoding="utf-8")
         return filepath, filename, mime
-    finally:
-        await db.close()
 
 
 async def _get_completed_chapters(db, job_id):

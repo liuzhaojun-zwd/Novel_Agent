@@ -20,9 +20,19 @@ export function useSSE(jobId, onEvent) {
       onEventRef.current?.("progress", data);
     });
 
+    es.addEventListener("token", (e) => {
+      const data = JSON.parse(e.data);
+      onEventRef.current?.("token", data);
+    });
+
     es.addEventListener("chapter_complete", (e) => {
       const data = JSON.parse(e.data);
       onEventRef.current?.("chapter_complete", data);
+    });
+
+    es.addEventListener("batch_complete", (e) => {
+      const data = JSON.parse(e.data);
+      onEventRef.current?.("batch_complete", data);
     });
 
     es.addEventListener("job_complete", (e) => {
