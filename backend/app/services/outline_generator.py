@@ -99,7 +99,7 @@ async def generate_outline_stream(
 
     # 先用 JSON mode 流式尝试
     try:
-        async for chunk in llm.chat_stream(messages, response_format={"type": "json_object"}):
+        async for chunk in llm.chat_stream(messages, max_tokens=16384, response_format={"type": "json_object"}):
             accumulated += chunk
             await publish_func("outline_token", text=chunk, accumulated=accumulated)
             await publish_func("outline_progress", message=f"已接收 {len(accumulated)} 字符...")
@@ -107,7 +107,7 @@ async def generate_outline_stream(
         logger.warning(f"JSON mode 流式失败，降级到非流式: {e}")
         await publish_func("outline_progress", message="JSON mode 流式异常，降级到非流式模式...")
         try:
-            result = await llm.chat_json(messages)
+            result = await llm.chat_json(messages, max_tokens=16384)
             accumulated = json.dumps(result, ensure_ascii=False)
             await publish_func("outline_token", text=accumulated, accumulated=accumulated)
         except Exception as e2:
@@ -148,7 +148,7 @@ async def generate_outline(setup: SetupCreate) -> list[dict]:
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。请始终输出 JSON。"},
         {"role": "user", "content": prompt},
     ]
-    result = await llm.chat_json(messages)
+    result = await llm.chat_json(messages, max_tokens=16384)
     chapters = _parse_outline_json(json.dumps(result, ensure_ascii=False), setup.chapter_count)
     return chapters
 
@@ -203,4 +203,42 @@ def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
+    # Fallback 2: JSON 被截断时，逐条提取完整的 chapter 对象
+    logger.warning("标准解析均失败，尝试逐个提取 chapter 对象（截断恢复）")
+    chapters = _extract_chapters_from_truncated(raw)
+    if chapters:
+        logger.info(f"截断恢复成功: 提取到 {len(chapters)} 章")
+        return chapters[:expected_count]
+
     return []
+
+
+def _extract_chapters_from_truncated(text: str) -> list[dict]:
+    """从截断的 JSON 中逐个提取完整的 chapter 对象。
+    
+    处理场景：LLM 输出被截断，JSON 末尾不完整，
+    但已生成的 chapter 对象是完整的。
+    
+    示例输入（截断）：
+    {"chapters": [{"chapter_number":1,"title":"A","summary":"..."}, 
+                  {"chapter_number":2,"title":"B","summary":"..."}
+    
+    输出：
+    [{"chapter_number":1,"title":"A","summary":"..."}, 
+     {"chapter_number":2,"title":"B","summary":"..."}]
+    """
+    # 匹配完整的 chapter 对象
+    # 格式: {"chapter_number": ..., "title": "...", "summary": "..."}
+    pattern = r'\{\s*"chapter_number"\s*:\s*\d+\s*,\s*"title"\s*:\s*"[^"]*"\s*,\s*"summary"\s*:\s*"[^"]*"\s*\}'
+    matches = re.findall(pattern, text)
+    
+    chapters = []
+    for m in matches:
+        try:
+            ch = json.loads(m)
+            if all(k in ch for k in ("chapter_number", "title", "summary")):
+                chapters.append(ch)
+        except json.JSONDecodeError:
+            continue
+    
+    return chapters
