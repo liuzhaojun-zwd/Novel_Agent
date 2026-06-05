@@ -1,24 +1,46 @@
-"""Novel_Agent — 大纲相关路由"""
+"""Novel_Agent — 大纲相关路由（支持流式生成）"""
+
+import asyncio
+import json
+import logging
 
 from fastapi import APIRouter, HTTPException
 from app.models import OutlineModifyRequest
 from app.services import job_service as svc
-from app.services.outline_generator import generate_outline
+from app.services.outline_generator import generate_outline_stream
+from app.services.progress_tracker import publish
 from app.models import SetupCreate
 
 router = APIRouter(prefix="/api/jobs/{job_id}", tags=["outline"])
+logger = logging.getLogger("novel_agent.outline")
 
 
 @router.post("/generate-outline")
 async def trigger_generate_outline(job_id: str):
-    """触发大纲生成"""
+    """触发大纲生成（后台流式任务）"""
     job = await svc.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
     if job.status not in ("pending",):
         raise HTTPException(status_code=400, detail=f"当前状态 {job.status} 不允许生成大纲")
 
+    # 锁状态
     await svc.update_job_status(job_id, "generating_outline")
+
+    # 后台异步生成大纲
+    asyncio.create_task(_run_outline_generation(job_id, job))
+
+    return {"message": "大纲生成已启动", "job_id": job_id}
+
+
+async def _run_outline_generation(job_id: str, job):
+    """后台运行大纲生成并推 SSE"""
+    logger.info(f"大纲生成后台任务启动: job={job_id[:8]}")
+
+    # 推初始进度
+    await publish(job_id, "outline_progress",
+                  message="正在调用 AI 生成大纲...",
+                  status="generating_outline")
 
     try:
         setup = SetupCreate(
@@ -31,12 +53,23 @@ async def trigger_generate_outline(job_id: str):
             world_setting=job.world_setting,
             narrative_perspective=job.narrative_perspective,
         )
-        outline = await generate_outline(setup)
+
+        # 流式生成（publish_func 直接复用 SSE）
+        async def sse_publish(event_type, **data):
+            await publish(job_id, event_type, **data)
+
+        outline = await generate_outline_stream(setup, job_id, sse_publish)
+
+        # 保存
         await svc.save_outline(job_id, outline)
-        return {"outline": outline, "message": "大纲生成成功"}
+        logger.info(f"大纲生成完成: job={job_id[:8]} {len(outline)}章")
+
     except Exception as e:
+        logger.error(f"大纲生成失败: job={job_id[:8]} error={e}", exc_info=True)
         await svc.update_job_status(job_id, "pending")
-        raise HTTPException(status_code=500, detail=f"大纲生成失败: {str(e)}")
+        await publish(job_id, "outline_error",
+                      error=str(e),
+                      message="大纲生成失败")
 
 
 @router.get("/outline")
@@ -62,7 +95,6 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
     outline = job.outline
     instruction = req.instruction.strip()
 
-    # 简单的自然语言指令解析
     import re
     modified = False
 
@@ -74,7 +106,7 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
             outline[idx]["title"] = m.group(2).strip()
             modified = True
 
-    # 匹配 "第N章摘要改为xxx" 或 "第N章情节改为xxx"
+    # 匹配 "第N章摘要改为xxx"
     m = re.search(r"第(\d+)章(?:摘要|情节|情节摘要|内容)改为[：:：]?\s*(.+)", instruction)
     if m:
         idx = int(m.group(1)) - 1
@@ -82,26 +114,11 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
             outline[idx]["summary"] = m.group(2).strip()
             modified = True
 
-    # 匹配 "第N章替换为" 或 "重写第N章"
-    m = re.search(r"重写第(\d+)章[：:：]?\s*标题[：:：]?\s*(.+?)[，,。]?\s*摘要[：:：]?\s*(.+)", instruction)
-    if not m:
-        m = re.search(r"把第(\d+)章(.+?)改为(.+)", instruction)
-    if m:
-        idx = int(m.group(1)) - 1
-        if 0 <= idx < len(outline):
-            if "标题" in instruction:
-                outline[idx]["title"] = instruction.split("标题")[-1].strip()
-            if "摘要" in instruction or "情节" in instruction:
-                outline[idx]["summary"] = instruction.split("摘要")[-1].strip() if "摘要" in instruction else instruction.split("情节")[-1].strip()
-            modified = True
-
     if not modified:
         raise HTTPException(status_code=400, detail="无法解析修改指令，请使用如'第3章标题改为xxx'的格式")
 
-    import json
     await svc.update_job_status(job_id, "pending", outline=json.dumps(outline, ensure_ascii=False))
 
-    # 同时更新 chapters 表中的标题和摘要
     from app.database import get_db
     async with get_db() as db:
         for ch in outline:

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { api } from "../api";
+import { useSSE } from "../hooks/useSSE";
 
 export default function OutlineView({ jobId, onConfirm, outline: initialOutline, onBack }) {
   const [outline, setOutline] = useState(initialOutline || []);
@@ -9,27 +10,53 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
   const [modifyMsg, setModifyMsg] = useState("");
   const mountedRef = useRef(true);
 
+  // 流式实时预览
+  const [streamText, setStreamText] = useState("");
+  const [streamProgress, setStreamProgress] = useState("");
+
   useEffect(() => {
     mountedRef.current = true;
     if (!initialOutline && jobId && !generating) {
-      loadOutline();
+      // 不自动触发，等用户点击
     }
     return () => { mountedRef.current = false; };
   }, [jobId]);
+
+  // SSE 监听大纲生成事件
+  useSSE(jobId, (event, data) => {
+    if (event === "outline_progress") {
+      setStreamProgress(data.message || "生成中...");
+      setGenerating(true);
+    } else if (event === "outline_token") {
+      setStreamText(data.accumulated || streamText + data.text);
+    } else if (event === "outline_done") {
+      // 大纲生成完成
+      setOutline(data.outline || []);
+      setGenerating(false);
+      setStreamText("");
+      setStreamProgress("");
+      setModifyMsg("✅ 大纲生成成功");
+    } else if (event === "outline_error") {
+      setGenerating(false);
+      setStreamText("");
+      setStreamProgress("");
+      setModifyMsg("❌ " + (data.message || data.error || "大纲生成失败"));
+    }
+  });
 
   const loadOutline = async () => {
     if (generating) return;
     setGenerating(true);
     setModifyMsg("");
+    setStreamText("");
+    setStreamProgress("正在请求 AI 生成大纲...");
     try {
       const data = await api.generateOutline(jobId);
-      if (mountedRef.current) {
-        setOutline(data.outline);
-        setModifyMsg("✅ 大纲生成成功");
-      }
+      // 返回后不代表完成，等待 SSE 事件
+      setModifyMsg("大纲正在生成中...");
     } catch (err) {
       if (mountedRef.current) {
-        // 如果是因为正在生成中，稍等后自动重试一次
+        setGenerating(false);
         if (err.message.includes("不允许")) {
           setModifyMsg("大纲正在生成中，请稍候...");
           setTimeout(() => {
@@ -39,8 +66,6 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
           setModifyMsg("❌ " + err.message);
         }
       }
-    } finally {
-      if (mountedRef.current) setGenerating(false);
     }
   };
 
@@ -94,7 +119,7 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
             disabled={generating}
             className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
-            {generating ? "⏳ 生成中..." : "🔄 重新生成"}
+            {generating ? "⏳ 生成中..." : "🔄 生成大纲"}
           </button>
           <button
             onClick={handleConfirm}
@@ -105,6 +130,30 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
           </button>
         </div>
       </div>
+
+      {/* 流式生成预览 */}
+      {generating && (
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-5 mb-6 animate-pulse">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="w-2 h-2 bg-blue-500 rounded-full animate-ping" />
+            <span className="text-sm font-medium text-blue-700">大纲生成中</span>
+            <span className="text-xs text-blue-400">{streamProgress}</span>
+          </div>
+          {streamText && (
+            <div className="bg-white rounded-lg p-3 text-xs text-gray-500 font-mono max-h-32 overflow-y-auto whitespace-pre-wrap break-all leading-relaxed">
+              {streamText}
+            </div>
+          )}
+          {!streamText && (
+            <div className="text-sm text-blue-400">
+              <div className="flex items-center gap-1">
+                <span>AI 正在构思中</span>
+                <span className="animate-bounce">...</span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 章节列表 */}
       <div className="space-y-3">
@@ -160,7 +209,7 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
           <p className="mt-2 text-sm text-gray-600">{modifyMsg}</p>
         )}
         <p className="mt-2 text-xs text-gray-400">
-          支持指令示例："第3章标题改为xxx"、"重写第5章摘要为xxx"、"把第4章标题改为xxx，摘要改为xxx"
+          支持指令示例："第3章标题改为xxx"、"重写第5章摘要为xxx"
         </p>
       </div>
     </div>

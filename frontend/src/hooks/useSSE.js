@@ -73,6 +73,35 @@ export function useSSE(jobId, onEvent) {
       } catch (_) {}
     });
 
+    // 大纲流式事件
+    es.addEventListener("outline_progress", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("outline_progress", data);
+      } catch (_) {}
+    });
+
+    es.addEventListener("outline_token", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("outline_token", data);
+      } catch (_) {}
+    });
+
+    es.addEventListener("outline_done", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("outline_done", data);
+      } catch (_) {}
+    });
+
+    es.addEventListener("outline_error", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("outline_error", data);
+      } catch (_) {}
+    });
+
     es.onerror = () => {
       es.close();
       setTimeout(connect, 3000);
