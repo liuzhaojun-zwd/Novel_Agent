@@ -228,7 +228,7 @@ async def _generate_single_batch(
     ]
 
     try:
-        async for chunk in llm_stream_with_fallback(messages, max_tokens=16384):
+        async for chunk in llm_stream_with_fallback(messages, max_tokens=8192):
             accumulated += chunk
             await publish_func("outline_token", text=chunk, accumulated=accumulated)
     except Exception as e:
@@ -253,17 +253,27 @@ async def _generate_single_batch(
     return chapters
 
 
-async def llm_stream_with_fallback(messages, max_tokens=16384):
-    """带降级的流式 LLM 调用"""
+async def llm_stream_with_fallback(messages, max_tokens=8192):
+    """带降级的流式 LLM 调用
+    
+    优先级：
+    1. 普通流式（某些 API 不支持 JSON mode 流式转空）
+    2. 非流式 JSON mode
+    """
     llm = LLMAdapter()
+    chunks = []
+    # 先试普通流式
     try:
-        async for chunk in llm.chat_stream(messages, max_tokens=max_tokens,
-                                            response_format={"type": "json_object"}):
+        async for chunk in llm.chat_stream(messages, max_tokens=max_tokens):
+            chunks.append(chunk)
             yield chunk
-    except Exception:
-        logger.warning("JSON mode 流式失败，降级到非流式")
-        llm2 = LLMAdapter()
-        result = await llm2.chat_json(messages, max_tokens=max_tokens)
+    except Exception as e:
+        logger.warning(f"普通流式失败: {e}")
+
+    # 普通流式空内容 → JSON mode 非流式
+    if not chunks:
+        logger.warning("流式为空，降级到非流式 JSON mode")
+        result = await LLMAdapter().chat_json(messages, max_tokens=max_tokens)
         yield json.dumps(result, ensure_ascii=False)
 
 
@@ -282,7 +292,7 @@ async def generate_outline(setup: SetupCreate) -> list[dict]:
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。请始终输出 JSON。"},
         {"role": "user", "content": full_prompt},
     ]
-    result = await LLMAdapter().chat_json(messages, max_tokens=16384)
+    result = await LLMAdapter().chat_json(messages, max_tokens=8192)
     chapters = _parse_outline_json(json.dumps(result, ensure_ascii=False), setup.chapter_count)
     return chapters
 
