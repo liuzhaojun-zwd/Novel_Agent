@@ -1,8 +1,11 @@
-"""Novel_Agent — 大纲生成器（支持 LLM 缓存）"""
+"""Novel_Agent — 大纲生成器（支持 LLM 缓存 + 日志）"""
+import logging
 from app.services.llm_adapter import LLMAdapter
 from app.services.llm_cache import get_cached, set_cache
 from app.config import get_llm_config
 from app.models import SetupCreate
+
+logger = logging.getLogger("novel_agent.outline")
 
 
 OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据以下创作设定，为小说生成一份完整的大纲。
@@ -57,13 +60,14 @@ async def generate_outline(setup: SetupCreate) -> list[dict]:
     llm = LLMAdapter()
     prompt = build_outline_prompt(setup)
     full_prompt = prompt  # 系统+用户消息合并用于缓存key
+    logger.info(f"生成大纲: theme={setup.theme} chapters={setup.chapter_count}")
 
-    # Issue 10: 尝试从缓存读取
     cfg = get_llm_config()
     cached = get_cached(full_prompt, cfg["model"])
     if cached:
         import json
         chapters = json.loads(cached)
+        logger.info(f"大纲缓存命中: {len(chapters)} 章")
         if len(chapters) == setup.chapter_count:
             return chapters
 

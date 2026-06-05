@@ -7,6 +7,8 @@
 - Issue 8: 写作质量评估
 """
 from typing import Optional
+import logging
+import time
 
 from app.services.llm_adapter import LLMAdapter
 from app.services import job_service as svc
@@ -16,6 +18,8 @@ from app.services.quality_scorer import score_chapter, score_summary
 from app.services.context_manager import select_context_summaries
 from app.services.llm_cache import get_cached, set_cache, clear_cache
 from app.models import SetupCreate
+
+logger = logging.getLogger("novel_agent.chapter")
 
 # 分段生成：每段目标 ~500 字
 _SEGMENT_TARGET_CHARS = 500
@@ -214,8 +218,12 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
         job_id: 任务 ID
         up_to: 可选，最多生成到第几章
     """
+    t_start = time.time()
+    logger.info(f"开始逐章生成: job={job_id[:8]} up_to={up_to}")
+
     job = await svc.get_job(job_id)
     if not job:
+        logger.warning(f"job 不存在: {job_id[:8]}")
         return
 
     setup = SetupCreate(
@@ -378,6 +386,8 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
         previous_summary_parts.append(f"第{chapter_num}章（{ch['title']}）：{ch['summary']}")
 
     # 全部完成
+    elapsed = time.time() - t_start
+    logger.info(f"全部章节生成完成: job={job_id[:8]} 耗时={elapsed:.0f}s 章节={setup.chapter_count}")
     await svc.update_job_status(job_id, "completed")
     await publish(job_id, "job_complete",
                   job_id=job_id,

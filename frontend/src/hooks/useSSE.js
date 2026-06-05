@@ -15,44 +15,65 @@ export function useSSE(jobId, onEvent) {
     const es = new EventSource(api.streamUrl(jobId));
     eventSourceRef.current = es;
 
+    // Issue 4: 初始状态快照（重连后补课）
+    es.addEventListener("initial_state", (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("initial_state", data);
+      } catch (_) {}
+    });
+
     es.addEventListener("progress", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("progress", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("progress", data);
+      } catch (_) {}
     });
 
     es.addEventListener("token", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("token", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("token", data);
+      } catch (_) {}
     });
 
     es.addEventListener("chapter_complete", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("chapter_complete", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("chapter_complete", data);
+      } catch (_) {}
     });
 
     es.addEventListener("batch_complete", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("batch_complete", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("batch_complete", data);
+      } catch (_) {}
     });
 
     es.addEventListener("job_complete", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("job_complete", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("job_complete", data);
+      } catch (_) {}
       es.close();
     });
 
     es.addEventListener("quality_issue", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("quality_issue", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("quality_issue", data);
+      } catch (_) {}
     });
 
     es.addEventListener("error", (e) => {
-      const data = JSON.parse(e.data);
-      onEventRef.current?.("error", data);
+      try {
+        const data = JSON.parse(e.data);
+        onEventRef.current?.("error", data);
+      } catch (_) {}
     });
 
     es.onerror = () => {
-      // 自动重连
       es.close();
       setTimeout(connect, 3000);
     };

@@ -137,6 +137,30 @@ export default function ProgressPanel({ jobId, onBack }) {
 
   // SSE 实时推送
   useSSE(jobId, (event, data) => {
+    if (event === "initial_state") {
+      // Issue 4: 重连后补课，使用初始状态快照更新组件
+      if (data.status) {
+        updateStatusText(data.status, data.current_chapter || 0, data.chapter_count || 0);
+        setCurrentChapter(data.current_chapter || 0);
+        setAlerts(data.alerts || []);
+        // 恢复章节列表中的状态信息
+        if (data.chapters && data.chapters.length > 0) {
+          setChapters(prev => prev.map(existing => {
+            const match = data.chapters.find(c => c.chapter_number === existing.chapter_number);
+            if (match) {
+              return { ...existing, word_count: match.word_count, status: match.status };
+            }
+            return existing;
+          }));
+          // 如果章节列表为空（还未加载），直接用初始状态的数据
+          if (data.chapters.length > 0) {
+            setChapters(data.chapters);
+          }
+        }
+      }
+      return;
+    }
+
     if (event === "progress") {
       setCurrentChapter(data.chapter);
       setStatusText(

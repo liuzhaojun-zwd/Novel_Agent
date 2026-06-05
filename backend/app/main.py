@@ -1,5 +1,6 @@
 """Novel_Agent — FastAPI 应用入口"""
 
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,14 +8,26 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.database import init_db
+from app.log_config import setup_logging, get_logger
 from app.routers import jobs, outline, chapters, export, stream, settings
+
+logger = get_logger("main")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时初始化数据库
+    # 启动时初始化
+    setup_logging()
     await init_db()
+    logger.info("Novel_Agent 启动完成")
+
+    from app.config import get_llm_config
+    cfg = get_llm_config()
+    logger.info(f"LLM 配置: model={cfg['model']}, base_url={cfg['base_url']}")
+    logger.info(f"API Key 已配置: {bool(cfg['api_key'])}")
+
     yield
+    logger.info("Novel_Agent 关闭")
 
 
 app = FastAPI(
