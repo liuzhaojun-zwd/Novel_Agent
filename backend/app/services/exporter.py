@@ -1,7 +1,7 @@
 """Novel_Agent — 导出器"""
 from app.database import get_db
 from pathlib import Path
-from app.config import DATA_DIR
+from app.config import get_data_dir
 
 
 async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
@@ -28,7 +28,7 @@ async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
             mime = "text/markdown; charset=utf-8"
 
         filename = f"{job['theme']}_{job_id[:8]}.{ext}"
-        filepath = str(DATA_DIR / filename)
+        filepath = str(get_data_dir() / filename)
         Path(filepath).write_text(content, encoding="utf-8")
         return filepath, filename, mime
 

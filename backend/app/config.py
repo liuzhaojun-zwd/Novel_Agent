@@ -4,6 +4,7 @@
 运行时配置优先于环境变量，重启后失效（需重新配置）。
 """
 
+import os
 from pydantic_settings import BaseSettings
 from pathlib import Path
 from typing import Optional
@@ -16,8 +17,10 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.8
 
-    # Database
-    database_path: str = "data/novel_agent.db"
+    # Database（支持通过环境变量覆盖，测试用）
+    database_path: str = os.environ.get(
+        "NOVEL_AGENT_DB_PATH", "data/novel_agent.db"
+    )
 
     # Server
     host: str = "0.0.0.0"
@@ -65,5 +68,14 @@ def is_llm_configured() -> bool:
     return bool(cfg["api_key"])
 
 
-DATA_DIR = Path(settings.database_path).parent
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = None
+
+
+def get_data_dir() -> Path:
+    """获取数据目录（懒初始化，确保测试时使用正确路径）"""
+    global DATA_DIR
+    if DATA_DIR is None or str(DATA_DIR) != str(Path(settings.database_path).parent):
+        d = Path(settings.database_path).parent
+        d.mkdir(parents=True, exist_ok=True)
+        DATA_DIR = d
+    return DATA_DIR
