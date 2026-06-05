@@ -149,14 +149,33 @@ export default function App() {
                 </button>
                 <div className="absolute right-0 mt-2 w-64 bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
                   {jobs.map((j) => (
-                    <button
+                    <div
                       key={j.id}
-                      onClick={() => handleSelectJob(j.id)}
-                      className="w-full text-left px-4 py-3 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 border-b border-gray-50 dark:border-gray-700 last:border-0 transition cursor-pointer"
+                      className="flex items-center px-4 py-3 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 border-b border-gray-50 dark:border-gray-700 last:border-0 transition group/item"
                     >
-                      <div className="font-medium truncate">{j.theme}</div>
-                      <div className="text-xs text-gray-400 mt-0.5">{j.status} · {j.created_at}</div>
-                    </button>
+                      <button
+                        onClick={() => handleSelectJob(j.id)}
+                        className="flex-1 text-left min-w-0"
+                      >
+                        <div className="font-medium truncate">{j.theme}</div>
+                        <div className="text-xs text-gray-400 mt-0.5">{j.status} · {j.created_at}</div>
+                      </button>
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (confirm(`删除任务「${j.theme}」？\n此操作不可恢复。`)) {
+                            try {
+                              await api.deleteJob(j.id);
+                              await loadJobs();
+                            } catch (_) {}
+                          }
+                        }}
+                        className="ml-2 opacity-0 group-hover/item:opacity-100 text-xs text-red-400 hover:text-red-600 transition cursor-pointer flex-shrink-0"
+                        title="删除任务"
+                      >
+                        🗑️
+                      </button>
+                    </div>
                   ))}
                 </div>
               </div>
