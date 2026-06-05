@@ -1,4 +1,4 @@
-"""Novel_Agent — 大纲生成器（支持流式输出 + 缓存 + JSON mode）"""
+"""Novel_Agent — 大纲生成器（分批生成 + 流式输出 + 缓存 + JSON mode）"""
 import json
 import logging
 import re
@@ -8,6 +8,9 @@ from app.config import get_llm_config
 from app.models import SetupCreate
 
 logger = logging.getLogger("novel_agent.outline")
+
+# 每批最多生成多少章（避免单次输出被截断）
+_BATCH_SIZE = 50
 
 
 OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据以下创作设定，为小说生成一份完整的大纲。
@@ -34,27 +37,81 @@ OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据
 }}
 """
 
+BATCH_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请为小说的第 {start}-{end} 章生成大纲。
+
+## 创作设定
+- 题材：{theme}
+- 主题/故事核心：{topic}
+{optional_fields}
+
+## 前文大纲概要
+{previous_batch_summary}
+
+## 本章节范围
+- 章节序号：第 {start} 章 到 第 {end} 章
+- 这是整个大系列中的第 {batch_index}/{total_batches} 批
+
+## 要求
+1. 生成从第 {start} 章到第 {end} 章的大纲，共 {count} 章
+2. 每个章节包含：章节序号 (1-based)、标题、情节摘要（50-150字）
+3. 情节要有推进感，与前文连贯
+4. 标题要有吸引力
+5. 输出必须是 JSON 格式
+
+## 输出格式
+{{
+  "chapters": [
+    {{"chapter_number": {start}, "title": "第{start}章标题", "summary": "本章情节摘要"}},
+    ...
+  ]
+}}
+"""
+
 
 def build_outline_prompt(setup: SetupCreate) -> str:
-    optional_lines = []
-    if setup.writing_style:
-        optional_lines.append(f"- 写作风格：{setup.writing_style}")
-    if setup.characters:
-        optional_lines.append(f"- 主要人物：{', '.join(setup.characters)}")
-    if setup.world_setting:
-        optional_lines.append(f"- 世界观设定：{setup.world_setting}")
-    if setup.narrative_perspective:
-        optional_lines.append(f"- 叙事视角：{setup.narrative_perspective}")
-    optional_str = "\n".join(optional_lines)
-    if optional_str:
-        optional_str = "\n" + optional_str
-
+    optional_lines = _build_optional_lines(setup)
     return OUTLINE_PROMPT_TEMPLATE.format(
         theme=setup.theme,
         topic=setup.topic,
         chapter_count=setup.chapter_count,
-        optional_fields=optional_str,
+        optional_fields=optional_lines,
     )
+
+
+def build_batch_prompt(
+    setup: SetupCreate,
+    start: int,
+    end: int,
+    batch_index: int,
+    total_batches: int,
+    previous_batch_summary: str = "",
+) -> str:
+    """构建分批生成的大纲 prompt"""
+    optional_lines = _build_optional_lines(setup)
+    return BATCH_PROMPT_TEMPLATE.format(
+        theme=setup.theme,
+        topic=setup.topic,
+        optional_fields=optional_lines,
+        start=start,
+        end=end,
+        count=end - start + 1,
+        batch_index=batch_index,
+        total_batches=total_batches,
+        previous_batch_summary=previous_batch_summary or "（这是第一批，无前文）",
+    )
+
+
+def _build_optional_lines(setup: SetupCreate) -> str:
+    lines = []
+    if setup.writing_style:
+        lines.append(f"- 写作风格：{setup.writing_style}")
+    if setup.characters:
+        lines.append(f"- 主要人物：{', '.join(setup.characters)}")
+    if setup.world_setting:
+        lines.append(f"- 世界观设定：{setup.world_setting}")
+    if setup.narrative_perspective:
+        lines.append(f"- 叙事视角：{setup.narrative_perspective}")
+    return "\n".join(lines) if lines else ""
 
 
 async def generate_outline_stream(
@@ -62,93 +119,170 @@ async def generate_outline_stream(
     job_id: str,
     publish_func,
 ) -> list[dict]:
-    """流式生成大纲，边生成边推 SSE 事件。
+    """分批流式生成大纲。
+
+    对于大量章节（> _BATCH_SIZE），自动拆成多批生成，
+    每批完成后保存并继续下一批，最后合并。
 
     Args:
         setup: 创作设定
         job_id: 任务 ID
-        publish_func: SSE 推送函数，签名 publish(event_type, **data)
+        publish_func: SSE 推送函数
 
     Returns:
-        章节列表
+        完整章节列表
     """
-    llm = LLMAdapter()
-    prompt = build_outline_prompt(setup)
-    full_prompt = prompt
-    logger.info(f"流式生成大纲: theme={setup.theme} chapters={setup.chapter_count}")
-
     cfg = get_llm_config()
+    all_chapters = []
+    total = setup.chapter_count
+    batch_size = _BATCH_SIZE
+    total_batches = (total + batch_size - 1) // batch_size
 
-    # 尝试缓存
+    logger.info(f"分批生成大纲: theme={setup.theme} total={total} batches={total_batches} batch_size={batch_size}")
+
+    # 尝试全量缓存
+    full_prompt = build_outline_prompt(setup)
     cached = get_cached(full_prompt, cfg["model"])
     if cached:
         chapters = json.loads(cached)
-        if len(chapters) == setup.chapter_count:
-            logger.info(f"大纲缓存命中: {len(chapters)} 章")
+        if len(chapters) == total:
+            logger.info(f"全量缓存命中: {len(chapters)} 章")
             await publish_func("outline_done", outline=chapters, message="大纲生成成功（缓存）")
             return chapters
 
-    # 流式生成（强制 JSON mode）
-    await publish_func("outline_progress", message="正在调用 AI 生成大纲...")
-    accumulated = ""
+    previous_batch_summary = ""
 
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size + 1
+        end = min(start + batch_size - 1, total)
+        batch_no = batch_idx + 1
+
+        await publish_func("outline_progress",
+                           message=f"正在生成第 {batch_no}/{total_batches} 批（{start}-{end}章）...",
+                           batch=batch_no,
+                           total_batches=total_batches,
+                           batch_start=start,
+                           batch_end=end)
+
+        chapters = await _generate_single_batch(
+            setup, start, end, batch_no, total_batches,
+            previous_batch_summary, cfg, publish_func,
+        )
+
+        if not chapters:
+            logger.error(f"第{batch_no}批大纲生成失败，终止")
+            raise RuntimeError(f"第 {batch_no}/{total_batches} 批大纲生成失败")
+
+        all_chapters.extend(chapters)
+
+        # 为下一批生成前文概要（从刚生成的这批取每章摘要）
+        summaries = [f"第{c['chapter_number']}章（{c['title']}）：{c['summary'][:60]}"
+                     for c in chapters[:5]]  # 只取前5章摘要就够了
+        previous_batch_summary = "\n".join(summaries)
+
+        logger.info(f"第{batch_no}批完成: {len(chapters)}章，累计{len(all_chapters)}章")
+
+    # 全部完成，缓存全量
+    if len(all_chapters) == total:
+        set_cache(full_prompt, cfg["model"], json.dumps(all_chapters, ensure_ascii=False))
+
+    await publish_func("outline_done", outline=all_chapters,
+                       message=f"大纲生成成功（共{batch_no}批，{len(all_chapters)}章）")
+    return all_chapters
+
+
+async def _generate_single_batch(
+    setup: SetupCreate,
+    start: int,
+    end: int,
+    batch_no: int,
+    total_batches: int,
+    previous_summary: str,
+    cfg: dict,
+    publish_func,
+) -> list[dict]:
+    """生成单批大纲"""
+    # 尝试该批的缓存
+    if total_batches == 1:
+        prompt = build_outline_prompt(setup)
+    else:
+        prompt = build_batch_prompt(
+            setup, start, end, batch_no, total_batches, previous_summary,
+        )
+
+    # 尝试批缓存
+    batch_cache_key = f"{prompt}::batch"
+    cached = get_cached(batch_cache_key, cfg["model"])
+    if cached:
+        chapters = json.loads(cached)
+        expected = end - start + 1
+        if len(chapters) == expected and chapters[0]["chapter_number"] == start:
+            logger.info(f"第{batch_no}批缓存命中: {len(chapters)}章")
+            return chapters
+
+    # 流式生成
+    accumulated = ""
     messages = [
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。请始终输出 JSON。"},
         {"role": "user", "content": prompt},
     ]
 
-    # 先用 JSON mode 流式尝试
     try:
-        async for chunk in llm.chat_stream(messages, max_tokens=16384, response_format={"type": "json_object"}):
+        async for chunk in llm_stream_with_fallback(messages, max_tokens=16384):
             accumulated += chunk
             await publish_func("outline_token", text=chunk, accumulated=accumulated)
-            await publish_func("outline_progress", message=f"已接收 {len(accumulated)} 字符...")
     except Exception as e:
-        logger.warning(f"JSON mode 流式失败，降级到非流式: {e}")
-        await publish_func("outline_progress", message="JSON mode 流式异常，降级到非流式模式...")
-        try:
-            result = await llm.chat_json(messages, max_tokens=16384)
-            accumulated = json.dumps(result, ensure_ascii=False)
-            await publish_func("outline_token", text=accumulated, accumulated=accumulated)
-        except Exception as e2:
-            raise RuntimeError(f"大纲生成失败（JSON mode 流式+非流式均异常）: {e2}")
+        logger.error(f"第{batch_no}批流式生成失败: {e}")
+        raise
 
-    # 解析 JSON
-    chapters = _parse_outline_json(accumulated, setup.chapter_count)
+    # 解析
+    chapters = _parse_outline_json(accumulated, end - start + 1)
 
-    if not chapters:
-        logger.error(f"大纲解析失败: 原始内容={accumulated[:500]}")
-        raise RuntimeError(
-            "AI 返回的内容无法解析为有效大纲。"
-            f"原始返回：{accumulated[:200]}..."
-        )
+    if chapters:
+        # 修正章节号偏移（如果是分批，LLM 可能从 1 开始计数而非 start）
+        offset = start - chapters[0]["chapter_number"]
+        if offset != 0:
+            for ch in chapters:
+                ch["chapter_number"] += offset
 
-    # 缓存
-    if len(chapters) == setup.chapter_count:
-        set_cache(full_prompt, cfg["model"], json.dumps(chapters, ensure_ascii=False))
+        # 缓存该批
+        expected = end - start + 1
+        if len(chapters) == expected:
+            set_cache(batch_cache_key, cfg["model"], json.dumps(chapters, ensure_ascii=False))
 
-    await publish_func("outline_done", outline=chapters, message="大纲生成成功")
     return chapters
+
+
+async def llm_stream_with_fallback(messages, max_tokens=16384):
+    """带降级的流式 LLM 调用"""
+    llm = LLMAdapter()
+    try:
+        async for chunk in llm.chat_stream(messages, max_tokens=max_tokens,
+                                            response_format={"type": "json_object"}):
+            yield chunk
+    except Exception:
+        logger.warning("JSON mode 流式失败，降级到非流式")
+        llm2 = LLMAdapter()
+        result = await llm2.chat_json(messages, max_tokens=max_tokens)
+        yield json.dumps(result, ensure_ascii=False)
 
 
 async def generate_outline(setup: SetupCreate) -> list[dict]:
     """非流式生成大纲（兜底用）"""
-    llm = LLMAdapter()
-    prompt = build_outline_prompt(setup)
-    logger.info(f"非流式生成大纲: theme={setup.theme} chapters={setup.chapter_count}")
-
     cfg = get_llm_config()
-    cached = get_cached(prompt, cfg["model"])
+    full_prompt = build_outline_prompt(setup)
+    cached = get_cached(full_prompt, cfg["model"])
     if cached:
         chapters = json.loads(cached)
         if len(chapters) == setup.chapter_count:
             return chapters
 
+    logger.info(f"非流式生成大纲: theme={setup.theme} chapters={setup.chapter_count}")
     messages = [
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。请始终输出 JSON。"},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": full_prompt},
     ]
-    result = await llm.chat_json(messages, max_tokens=16384)
+    result = await LLMAdapter().chat_json(messages, max_tokens=16384)
     chapters = _parse_outline_json(json.dumps(result, ensure_ascii=False), setup.chapter_count)
     return chapters
 
@@ -169,12 +303,11 @@ def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # 尝试从流式片段中提取 JSON（可能包含 markdown 包裹或前缀文本）
-    # 匹配 { ... "chapters": ... }
+    # 尝试从流式片段中提取 JSON
     patterns = [
-        r'\{[\s\S]*?"chapters"[\s\S]*?\}',    # 标准 JSON
-        r'```json\s*([\s\S]*?)```',             # Markdown ```json
-        r'```\s*([\s\S]*?)```',                 # Markdown ``` (any)
+        r'\{[\s\S]*?"chapters"[\s\S]*?\}',
+        r'```json\s*([\s\S]*?)```',
+        r'```\s*([\s\S]*?)```',
     ]
     for pattern in patterns:
         m = re.search(pattern, raw)
@@ -189,12 +322,11 @@ def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
             except json.JSONDecodeError:
                 continue
 
-    logger.warning(f"大纲解析失败，尝试用 fallback 提取")
-    # Fallback: 尝试从最外层 `{` 到 `}` 截取
+    # Fallback: 截取最外层 {}
     start = raw.find("{")
     end = raw.rfind("}")
     if start != -1 and end != -1 and end > start:
-        candidate = raw[start:end+1]
+        candidate = raw[start:end + 1]
         try:
             data = json.loads(candidate)
             chapters = data.get("chapters", [])
@@ -203,8 +335,7 @@ def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    # Fallback 2: JSON 被截断时，逐条提取完整的 chapter 对象
-    logger.warning("标准解析均失败，尝试逐个提取 chapter 对象（截断恢复）")
+    # Fallback: 逐条提取完整的 chapter 对象（截断恢复）
     chapters = _extract_chapters_from_truncated(raw)
     if chapters:
         logger.info(f"截断恢复成功: 提取到 {len(chapters)} 章")
@@ -214,24 +345,13 @@ def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
 
 
 def _extract_chapters_from_truncated(text: str) -> list[dict]:
-    """从截断的 JSON 中逐个提取完整的 chapter 对象。
-    
-    处理场景：LLM 输出被截断，JSON 末尾不完整，
-    但已生成的 chapter 对象是完整的。
-    
-    示例输入（截断）：
-    {"chapters": [{"chapter_number":1,"title":"A","summary":"..."}, 
-                  {"chapter_number":2,"title":"B","summary":"..."}
-    
-    输出：
-    [{"chapter_number":1,"title":"A","summary":"..."}, 
-     {"chapter_number":2,"title":"B","summary":"..."}]
-    """
-    # 匹配完整的 chapter 对象
-    # 格式: {"chapter_number": ..., "title": "...", "summary": "..."}
-    pattern = r'\{\s*"chapter_number"\s*:\s*\d+\s*,\s*"title"\s*:\s*"[^"]*"\s*,\s*"summary"\s*:\s*"[^"]*"\s*\}'
+    """从截断的 JSON 中逐个提取完整的 chapter 对象"""
+    pattern = (
+        r'\{\s*"chapter_number"\s*:\s*\d+\s*,'
+        r'\s*"title"\s*:\s*"[^"]*"\s*,'
+        r'\s*"summary"\s*:\s*"[^"]*"\s*\}'
+    )
     matches = re.findall(pattern, text)
-    
     chapters = []
     for m in matches:
         try:
@@ -240,5 +360,4 @@ def _extract_chapters_from_truncated(text: str) -> list[dict]:
                 chapters.append(ch)
         except json.JSONDecodeError:
             continue
-    
     return chapters

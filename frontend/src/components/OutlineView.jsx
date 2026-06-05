@@ -13,6 +13,7 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
   // 流式实时预览
   const [streamText, setStreamText] = useState("");
   const [streamProgress, setStreamProgress] = useState("");
+  const [batchInfo, setBatchInfo] = useState(null); // {batch, total_batches, batch_start, batch_end}
 
   useEffect(() => {
     mountedRef.current = true;
@@ -27,6 +28,9 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
     if (event === "outline_progress") {
       setStreamProgress(data.message || "生成中...");
       setGenerating(true);
+      if (data.batch) {
+        setBatchInfo({ batch: data.batch, total: data.total_batches, start: data.batch_start, end: data.batch_end });
+      }
     } else if (event === "outline_token") {
       setStreamText(data.accumulated || streamText + data.text);
     } else if (event === "outline_done") {
@@ -35,11 +39,13 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
       setGenerating(false);
       setStreamText("");
       setStreamProgress("");
-      setModifyMsg("✅ 大纲生成成功");
+      setBatchInfo(null);
+      setModifyMsg("✅ " + (data.message || "大纲生成成功"));
     } else if (event === "outline_error") {
       setGenerating(false);
       setStreamText("");
       setStreamProgress("");
+      setBatchInfo(null);
       setModifyMsg("❌ " + (data.message || data.error || "大纲生成失败"));
     }
   });
@@ -133,12 +139,26 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
 
       {/* 流式生成预览 */}
       {generating && (
-        <div className="bg-blue-50 border border-blue-100 rounded-xl p-5 mb-6 animate-pulse">
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-5 mb-6">
           <div className="flex items-center gap-2 mb-2">
             <span className="w-2 h-2 bg-blue-500 rounded-full animate-ping" />
             <span className="text-sm font-medium text-blue-700">大纲生成中</span>
+            {batchInfo && (
+              <span className="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full">
+                第 {batchInfo.batch}/{batchInfo.total} 批（{batchInfo.start}-{batchInfo.end}章）
+              </span>
+            )}
             <span className="text-xs text-blue-400">{streamProgress}</span>
           </div>
+          {/* 批次进度条 */}
+          {batchInfo && batchInfo.total > 1 && (
+            <div className="w-full bg-blue-100 rounded-full h-1.5 mb-3 overflow-hidden">
+              <div
+                className="bg-blue-500 h-full rounded-full transition-all duration-500"
+                style={{ width: `${(batchInfo.batch / batchInfo.total) * 100}%` }}
+              />
+            </div>
+          )}
           {streamText && (
             <div className="bg-white rounded-lg p-3 text-xs text-gray-500 font-mono max-h-32 overflow-y-auto whitespace-pre-wrap break-all leading-relaxed">
               {streamText}
