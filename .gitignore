@@ -26,10 +26,8 @@ backend/data/
 backend/structure.txt
 *.log
 
-# 文档 — 只保留 README.md
+# 文档 — 只保留 README.md，其他 MD 文档忽略
 ARCHITECTURE.md
 IMPROVEMENTS.md
 REQUIREMENTS.md
 TASKS.md
-backend/requirements.txt
-frontend/README.md
