@@ -1,8 +1,8 @@
-"""Novel_Agent — 章节路由"""
+"""Novel_Agent — 章节路由（含 Issue 7：章节编辑与重新生成）"""
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from app.services import job_service as svc
-from app.services.chapter_generator import generate_chapters
+from app.services.chapter_generator import generate_chapters, regenerate_chapter
 from app.models import ChapterResponse
 
 router = APIRouter(prefix="/api/jobs/{job_id}", tags=["chapters"])
@@ -43,6 +43,40 @@ async def get_chapter(job_id: str, chapter_number: int):
                 status=c["status"],
             )
     raise HTTPException(status_code=404, detail="章节不存在")
+
+
+@router.put("/chapters/{chapter_number}")
+async def update_chapter(
+    job_id: str,
+    chapter_number: int,
+    content: str = Body(..., embed=True),
+):
+    """Issue 7: 手动编辑章节内容"""
+    chapters = await svc.get_job_chapters(job_id)
+    target = None
+    for c in chapters:
+        if c["chapter_number"] == chapter_number:
+            target = c
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail="章节不存在")
+
+    word_count = len(content.replace(" ", "").replace("\n", ""))
+    await svc.save_chapter(job_id, chapter_number, content, word_count, target["title"])
+    return {"message": "章节已更新", "word_count": word_count}
+
+
+@router.post("/chapters/{chapter_number}/regenerate")
+async def regenerate_chapter_endpoint(
+    job_id: str,
+    chapter_number: int,
+    instruction: str = Body("", embed=True),
+):
+    """Issue 7: 重新生成指定章节（可附带修改指令）"""
+    result = await regenerate_chapter(job_id, chapter_number, instruction)
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "重新生成失败"))
+    return result
 
 
 @router.post("/start")
@@ -88,7 +122,6 @@ async def resume_generation(
     if job.status != "paused":
         raise HTTPException(status_code=400, detail=f"当前状态 {job.status} 不允许续生，只有 paused 状态可续生")
 
-    # 校验 up_to 范围
     if up_to is not None:
         if up_to <= job.current_chapter or up_to > job.chapter_count:
             raise HTTPException(
@@ -96,7 +129,6 @@ async def resume_generation(
                 detail=f"已生成到第 {job.current_chapter} 章，up_to 须在 {job.current_chapter + 1}-{job.chapter_count} 之间",
             )
 
-    # 立即锁状态
     await svc.update_job_status(job_id, "generating_chapters")
 
     import asyncio

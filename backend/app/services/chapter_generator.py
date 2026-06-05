@@ -1,10 +1,22 @@
-"""Novel_Agent — 章节生成器"""
+"""Novel_Agent — 章节生成器
+
+增强版：
+- Issue 6: 分段生成 + 章节内 checkpoint（每段立即持久化）
+- Issue 5: 增强版一致性检查器（跨章节追踪）
+- Issue 7: 支持指定章节重新生成
+- Issue 8: 写作质量评估
+"""
+
 from app.services.llm_adapter import LLMAdapter
 from app.services import job_service as svc
 from app.services.progress_tracker import publish
 from app.services.consistency_checker import check_consistency
-from app.services.context_manager import select_context_summaries, estimate_tokens
+from app.services.quality_scorer import score_chapter, score_summary
+from app.services.context_manager import select_context_summaries
 from app.models import SetupCreate
+
+# 分段生成：每段目标 ~500 字
+_SEGMENT_TARGET_CHARS = 500
 
 CHAPTER_PROMPT_TEMPLATE = """你是一位专业小说作家，请根据以下设定和章节大纲，创作一篇小说的章节正文。
 
@@ -27,8 +39,15 @@ CHAPTER_PROMPT_TEMPLATE = """你是一位专业小说作家，请根据以下设
 2. 保持与人物设定一致
 3. 情节扣题，细节丰富
 4. 语言风格保持一致
-5. 直接输出正文内容，不要输出章节标题
+5. 按照自然段落换行，段落之间用空行分隔
+6. 直接输出正文内容，不要输出章节标题
 """
+
+SEGMENT_PROMPT_SUFFIX = """
+
+---
+
+⚠️ 注意：以上为本章节的一部分内容。请继续创作下一段正文，保持与上文的连贯性。当前已写约 {written_chars} 字，目标约 {target_words} 字。请继续，不要重复已写的内容。"""
 
 
 def build_chapter_prompt(
@@ -68,13 +87,117 @@ def build_chapter_prompt(
     )
 
 
+async def _generate_single_chapter(
+    llm: LLMAdapter,
+    job_id: str,
+    setup: SetupCreate,
+    ch: dict,
+    previous_summary_parts: list,
+) -> tuple[bool, str, int]:
+    """生成单个章节（支持分段 checkpoint）。
+    
+    返回 (success, content, word_count)
+    """
+    chapter_num = ch["chapter_number"]
+
+    # 上下文窗口动态管理
+    selected_summaries = select_context_summaries(previous_summary_parts)
+    context_summary = "\n".join(selected_summaries)
+
+    main_prompt = build_chapter_prompt(
+        setup, chapter_num, ch["title"], ch["summary"], context_summary,
+    )
+
+    full_content = ""
+    segment = 0
+    target_char_count = setup.words_per_chapter
+
+    while True:
+        # 构造当前段的 prompt
+        if segment == 0:
+            prompt = main_prompt
+        else:
+            prompt = main_prompt + SEGMENT_PROMPT_SUFFIX.format(
+                written_chars=len(full_content.replace(" ", "").replace("\n", "")),
+                target_words=target_char_count,
+            )
+
+        messages = [
+            {"role": "system", "content": "你是一位专业小说作家，擅长创作引人入胜的故事。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            content_chunks = []
+            accumulated = ""
+            async for chunk in llm.chat_stream(messages):
+                content_chunks.append(chunk)
+                accumulated += chunk
+                await publish(job_id, "token",
+                              chapter=chapter_num,
+                              text=chunk,
+                              accumulated=full_content + accumulated)
+
+            segment_content = "".join(content_chunks)
+        except Exception as e:
+            # 超时/错误，但已有部分内容——先保存 checkpoint
+            if full_content:
+                await _save_segment_checkpoint(job_id, chapter_num, full_content, "partial")
+            return False, full_content, len(full_content.replace(" ", "").replace("\n", ""))
+
+        # 追加到全文
+        if full_content:
+            full_content += "\n\n"
+        full_content += segment_content
+        segment += 1
+
+        # 保存段 checkpoint（覆盖写，每段持久化）
+        await _save_segment_checkpoint(job_id, chapter_num, full_content, "generating")
+
+        # 检查字数是否达标
+        char_count = len(full_content.replace(" ", "").replace("\n", ""))
+        if char_count >= target_char_count:
+            break
+
+        # 防止死循环（最多 6 段）
+        if segment >= 6:
+            break
+
+    char_count = len(full_content.replace(" ", "").replace("\n", ""))
+    return True, full_content, char_count
+
+
+async def _save_segment_checkpoint(job_id: str, chapter_number: int, content: str, status: str):
+    """保存章节的段级 checkpoint（覆盖写，始终保留最新内容）"""
+    from app.database import get_db
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE chapters SET content = ?, status = ? WHERE job_id = ? AND chapter_number = ?",
+            (content, status, job_id, chapter_number),
+        )
+
+
+async def _get_segment_checkpoint(job_id: str, chapter_number: int) -> tuple[str, str]:
+    """读取已保存的段级 checkpoint"""
+    from app.database import get_db
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT content, status FROM chapters WHERE job_id = ? AND chapter_number = ?",
+            (job_id, chapter_number),
+        )
+        row = await cursor.fetchone()
+        if row:
+            return row["content"], row["status"]
+        return "", "generating"
+
+
 async def generate_chapters(job_id: str, up_to: int | None = None):
     """
-    逐章生成正文（后台任务），支持流式输出。
+    逐章生成正文（后台任务），支持分段 checkpoint 和质量评估。
 
     Args:
         job_id: 任务 ID
-        up_to: 可选，最多生成到第几章。不传则为 None 则生成全部章节。
+        up_to: 可选，最多生成到第几章
     """
     job = await svc.get_job(job_id)
     if not job:
@@ -101,7 +224,9 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
     llm = LLMAdapter()
 
     previous_summary_parts = []
-    fail_count = 0
+    # 跨章节人物跟踪
+    characters_seen_overall = {}
+    chapter_scores = []
 
     for ch in chapters:
         if ch["status"] == "completed":
@@ -112,111 +237,211 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
 
         chapter_num = ch["chapter_number"]
 
-        # 检查是否达到用户指定的上限
+        # 检查是否达到上限
         if up_to is not None and chapter_num > up_to:
             remain = setup.chapter_count - (chapter_num - 1)
             await svc.update_job_status(job_id, "paused")
             await publish(job_id, "batch_complete",
-                          chapter=chapter_num - 1,
-                          total=setup.chapter_count,
+                          chapter=chapter_num - 1, total=setup.chapter_count,
                           status="paused",
-                          message=f"已按您的要求写到第{chapter_num - 1}章，剩余{remain}章待续")
+                          message=f"已写到第{chapter_num - 1}章，剩余{remain}章待续")
             return
 
-        # 推送进度
         await publish(job_id, "progress",
                       chapter=chapter_num, total=job.chapter_count,
                       status="generating_chapters",
                       message=f"正在写第 {chapter_num}/{job.chapter_count} 章")
 
-        # --- 上下文窗口动态管理 ---
-        # 自动选择合适的摘要数量，避免超出上下文预算
-        selected_summaries = select_context_summaries(previous_summary_parts)
-        context_summary = "\n".join(selected_summaries)
-
-        prompt = build_chapter_prompt(
-            setup, chapter_num, ch["title"], ch["summary"], context_summary,
-        )
-
-        retry_count = 0
-        success = False
-        content = ""
-
-        while retry_count < 3 and not success:
-            try:
+        # ── 尝试恢复段级 checkpoint ──
+        saved_content, saved_status = await _get_segment_checkpoint(job_id, chapter_num)
+        if saved_content and saved_status == "generating":
+            # 有段级 checkpoint，从已有内容继续
+            full_content = saved_content
+            current_chars = len(full_content.replace(" ", "").replace("\n", ""))
+            if current_chars >= setup.words_per_chapter * 0.9:
+                # 已足够，直接完成
+                pass
+            else:
+                # 使用 checkpoint 内容继续生成（给 LLM 上下文）
+                checkpoint_prompt = (
+                    f"以下是第 {chapter_num} 章（{ch['title']}）已生成的部分内容，"
+                    f"请继续创作后续内容，不要重复。\n\n{full_content}"
+                )
                 messages = [
                     {"role": "system", "content": "你是一位专业小说作家，擅长创作引人入胜的故事。"},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": checkpoint_prompt},
                 ]
-
-                # 流式输出：一边接收 LLM 返回的 token，一边推送 SSE
-                # 同时累积完整内容
                 content_chunks = []
                 accumulated = ""
-                async for chunk in llm.chat_stream(messages):
-                    content_chunks.append(chunk)
-                    accumulated += chunk
-                    # 每收到一段 token 就推送 SSE，前端实时显示
-                    await publish(job_id, "token",
-                                  chapter=chapter_num,
-                                  text=chunk,
-                                  accumulated=accumulated)
+                try:
+                    async for chunk in llm.chat_stream(messages):
+                        content_chunks.append(chunk)
+                        accumulated += chunk
+                        await publish(job_id, "token",
+                                      chapter=chapter_num, text=chunk,
+                                      accumulated=full_content + accumulated)
+                    full_content += "\n\n" + "".join(content_chunks)
+                except Exception:
+                    pass  # 保留已有内容即可
 
-                content = "".join(content_chunks)
+            await _save_segment_checkpoint(job_id, chapter_num, full_content, "generating")
+        else:
+            # 正常分段生成
+            success, full_content, char_count = await _generate_single_chapter(
+                llm, job_id, setup, ch, previous_summary_parts,
+            )
 
-                # 字数校验
-                word_count = len(content.replace(" ", "").replace("\n", ""))
-                if word_count < setup.words_per_chapter * 0.5:
-                    retry_count += 1
-                    if retry_count < 3:
-                        await publish(job_id, "progress",
-                                      chapter=chapter_num,
-                                      total=job.chapter_count,
-                                      status="generating_chapters",
-                                      message=f"第 {chapter_num} 章字数不足（{word_count}/{setup.words_per_chapter}），正在重新生成...")
-                        continue
+        char_count = len(full_content.replace(" ", "").replace("\n", ""))
 
-                success = True
+        # ── 字数校验 & 重试 ──
+        retries = 0
+        while retries < 3 and char_count < setup.words_per_chapter * 0.5:
+            await publish(job_id, "progress",
+                          chapter=chapter_num, total=job.chapter_count,
+                          status="generating_chapters",
+                          message=f"第 {chapter_num} 章字数不足（{char_count}/{setup.words_per_chapter}），重试中...")
+            retries += 1
+            # 重新全文生成（覆盖已有内容）
+            success, full_content, char_count = await _generate_single_chapter(
+                llm, job_id, setup, ch, previous_summary_parts,
+            )
+            char_count = len(full_content.replace(" ", "").replace("\n", ""))
 
-            except Exception as e:
-                retry_count += 1
-                await publish(job_id, "error",
-                              chapter=chapter_num,
-                              error=str(e),
-                              retry_count=retry_count)
-                if retry_count >= 3:
-                    await svc.update_job_status(job_id, "failed")
-                    await publish(job_id, "error",
-                                  chapter=chapter_num,
-                                  error=f"章节连续生成失败3次，任务已终止",
-                                  retry_count=3)
-                    return
-
-        if not success:
+        if char_count < setup.words_per_chapter * 0.5:
             await svc.update_job_status(job_id, "failed")
             await publish(job_id, "error",
                           chapter=chapter_num,
-                          error="章节生成失败")
+                          error=f"第 {chapter_num} 章连续生成失败3次，字数不足，任务已终止")
             return
 
-        word_count = len(content.replace(" ", "").replace("\n", ""))
-        await svc.save_chapter(job_id, chapter_num, content, word_count, ch["title"])
+        # ── 完成保存 ──
+        await svc.save_chapter(job_id, chapter_num, full_content, char_count, ch["title"])
 
-        # 一致性检查
+        # ── Issue 5: 增强版一致性检查 ──
+        consistency_alerts = []
         if setup.characters:
-            alerts = await check_consistency(content, setup.characters, chapter_num)
+            alerts, chars_seen, characters_seen_overall = await check_consistency(
+                full_content, setup.characters, chapter_num, characters_seen_overall,
+            )
             for alert in alerts:
                 await svc.add_consistency_alert(job_id, alert["chapter_number"], alert["conflict_name"])
+            consistency_alerts = alerts
 
-        previous_summary_parts.append(f"第{chapter_num}章（{ch['title']}）：{ch['summary']}")
-
+        # ── Issue 8: 写作质量评估 ──
+        quality = score_chapter(full_content, ch["title"], setup.words_per_chapter, chapter_num)
+        chapter_scores.append({"chapter": chapter_num, "score": quality["overall"]})
+        
         await publish(job_id, "chapter_complete",
                       chapter=chapter_num,
                       title=ch["title"],
-                      word_count=word_count)
+                      word_count=char_count,
+                      quality_score=quality["overall"],
+                      quality_summary=score_summary(quality))
+
+        # 如果有质量问题，推送给用户
+        if quality["issues"]:
+            await publish(job_id, "quality_issue",
+                          chapter=chapter_num,
+                          issues=quality["issues"],
+                          score=quality["overall"])
+
+        previous_summary_parts.append(f"第{chapter_num}章（{ch['title']}）：{ch['summary']}")
 
     # 全部完成
     await svc.update_job_status(job_id, "completed")
     await publish(job_id, "job_complete",
                   job_id=job_id,
-                  status="completed")
+                  status="completed",
+                  scores=chapter_scores)
+
+
+async def regenerate_chapter(
+    job_id: str,
+    chapter_number: int,
+    instruction: str = "",
+) -> dict:
+    """重新生成指定章节（Issue 7：生成后改稿）。
+
+    Args:
+        job_id: 任务 ID
+        chapter_number: 章节序号
+        instruction: 用户修改指令（可选）
+    """
+    job = await svc.get_job(job_id)
+    if not job:
+        return {"success": False, "error": "任务不存在"}
+
+    setup = SetupCreate(
+        theme=job.theme,
+        topic=job.topic,
+        chapter_count=job.chapter_count,
+        words_per_chapter=job.words_per_chapter,
+        writing_style=job.writing_style,
+        characters=job.characters,
+        world_setting=job.world_setting,
+        narrative_perspective=job.narrative_perspective,
+    )
+
+    chapters = await svc.get_job_chapters(job_id)
+    target_ch = None
+    for ch in chapters:
+        if ch["chapter_number"] == chapter_number:
+            target_ch = ch
+            break
+
+    if not target_ch:
+        return {"success": False, "error": f"章节 {chapter_number} 不存在"}
+
+    # 构建前文摘要
+    previous_summary_parts = []
+    for ch in chapters:
+        if ch["chapter_number"] >= chapter_number:
+            break
+        if ch.get("summary"):
+            previous_summary_parts.append(f"第{ch['chapter_number']}章（{ch['title']}）：{ch['summary']}")
+
+    selected_summaries = select_context_summaries(previous_summary_parts)
+    context_summary = "\n".join(selected_summaries)
+
+    llm = LLMAdapter()
+
+    # 构建 prompt（含修改指令）
+    prompt = build_chapter_prompt(
+        setup, chapter_number, target_ch["title"], target_ch["summary"], context_summary,
+    )
+    if instruction:
+        prompt += f"\n\n## 用户修改要求\n{instruction}\n请根据以上修改要求重新创作本章正文。"
+
+    messages = [
+        {"role": "system", "content": "你是一位专业小说作家，擅长创作引人入胜的故事。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    content_chunks = []
+    try:
+        previous_content = ""
+        async for chunk in llm.chat_stream(messages):
+            content_chunks.append(chunk)
+            previous_content += chunk
+            await publish(job_id, "token",
+                          chapter=chapter_number,
+                          text=chunk,
+                          accumulated=previous_content)
+    except Exception as e:
+        return {"success": False, "error": f"重新生成失败: {str(e)}"}
+
+    content = "".join(content_chunks)
+    word_count = len(content.replace(" ", "").replace("\n", ""))
+
+    # 保存新内容
+    await svc.save_chapter(job_id, chapter_number, content, word_count, target_ch["title"])
+
+    # 质量评估
+    quality = score_chapter(content, target_ch["title"], setup.words_per_chapter, chapter_number)
+
+    return {
+        "success": True,
+        "content": content,
+        "word_count": word_count,
+        "quality": quality,
+    }

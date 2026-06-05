@@ -41,6 +41,11 @@ export function useSSE(jobId, onEvent) {
       es.close();
     });
 
+    es.addEventListener("quality_issue", (e) => {
+      const data = JSON.parse(e.data);
+      onEventRef.current?.("quality_issue", data);
+    });
+
     es.addEventListener("error", (e) => {
       const data = JSON.parse(e.data);
       onEventRef.current?.("error", data);

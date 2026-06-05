@@ -50,6 +50,19 @@ export const api = {
 
   getChapter: (id, num) => request(`/api/jobs/${id}/chapters/${num}`),
 
+  // Issue 7: 章节编辑 & 重写
+  updateChapter: (id, num, content) =>
+    request(`/api/jobs/${id}/chapters/${num}`, {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
+
+  regenerateChapter: (id, num, instruction = "") =>
+    request(`/api/jobs/${id}/chapters/${num}/regenerate`, {
+      method: "POST",
+      body: JSON.stringify({ instruction }),
+    }),
+
   // 导出
   getExportUrl: (id, format = "md") => `/api/jobs/${id}/export?format=${format}`,
 
