@@ -2,12 +2,13 @@
 
 负责：
 1. Token 估算（中英文差异计数）
-2. 动态选择前文摘要（基于 token budget）
+2. 动态选择前文摘要（基于 token budget，从配置读取窗口大小）
 3. 摘要压缩（超出窗口时自动截断）
 """
 
 import re
 from typing import Optional
+from app.config import settings
 
 # 中文 ≈ 每字 1.5 token，英文 ≈ 每词 1.3 token
 _CHINESE_CHAR_WEIGHT = 1.5
@@ -16,11 +17,7 @@ _ENGLISH_WORD_WEIGHT = 1.3
 # 系统提示词和用户消息的固定开销（token 数）
 _SYSTEM_PROMPT_TOKENS = 200
 _USER_PROMPT_OVERHEAD = 100
-_RESPONSE_BUDGET = 4096  # 留给生成内容的 token
-
-# 默认上下文预算（总上下文窗口 - 响应预算 - 固定开销）
-_DEFAULT_TOTAL_WINDOW = 32000
-_DEFAULT_CONTEXT_BUDGET = _DEFAULT_TOTAL_WINDOW - _SYSTEM_PROMPT_TOKENS - _USER_PROMPT_OVERHEAD - _RESPONSE_BUDGET
+_RESPONSE_BUDGET = 8192  # 留给生成内容的 token（大窗口模型给更多空间）
 
 
 def estimate_tokens(text: str) -> int:
@@ -59,13 +56,13 @@ def select_context_summaries(
     
     Args:
         summaries: 已完成的章节摘要列表，每项格式如 "第N章（标题）：摘要"
-        budget: token 预算，默认使用 _DEFAULT_CONTEXT_BUDGET
+        budget: token 预算，默认使用动态配置
     
     Returns:
         选中的摘要列表（按时间顺序，最新的优先）
     """
     if budget is None:
-        budget = _DEFAULT_CONTEXT_BUDGET
+        budget = get_context_budget()
     
     if not summaries:
         return []
@@ -115,5 +112,5 @@ def _compress_summary(summary: str, max_chars: int = 100) -> str:
 def get_context_budget(total_window: Optional[int] = None) -> int:
     """获取当前可用的上下文预算（token）"""
     if total_window is None:
-        total_window = _DEFAULT_TOTAL_WINDOW
+        total_window = settings.llm_context_window
     return total_window - _SYSTEM_PROMPT_TOKENS - _USER_PROMPT_OVERHEAD - _RESPONSE_BUDGET

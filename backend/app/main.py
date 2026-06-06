@@ -2,31 +2,43 @@
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from starlette.responses import Response
 
-from app.database import init_db
+from app.database import init_db, close_db
 from app.log_config import setup_logging, get_logger
-from app.routers import jobs, outline, chapters, export, stream, settings
+from app.config import settings
+from app.routers import jobs, outline, chapters, export, stream, settings as settings_router
 
 logger = get_logger("main")
+
+
+# ── 鉴权依赖 ──
+async def verify_admin_token(request: Request):
+    """验证管理员 Token（从 header 或 query param）"""
+    token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
+    if not token or token != settings.admin_token:
+        raise HTTPException(status_code=401, detail="未授权：请提供有效的 X-Admin-Token")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时初始化
     setup_logging()
-    await init_db()
+    db = await init_db()
     logger.info("Novel_Agent 启动完成")
 
     from app.config import get_llm_config
     cfg = get_llm_config()
     logger.info(f"LLM 配置: model={cfg['model']}, base_url={cfg['base_url']}")
     logger.info(f"API Key 已配置: {bool(cfg['api_key'])}")
+    logger.info(f"Admin Token: {settings.admin_token[:4]}...")
 
     yield
+    await close_db(db)
     logger.info("Novel_Agent 关闭")
 
 
@@ -46,13 +58,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由
-app.include_router(jobs.router)
-app.include_router(outline.router)
-app.include_router(chapters.router)
-app.include_router(export.router)
-app.include_router(stream.router)
-app.include_router(settings.router)
+# 注册路由（带鉴权保护）
+app.include_router(jobs.router, dependencies=[Depends(verify_admin_token)])
+app.include_router(outline.router, dependencies=[Depends(verify_admin_token)])
+app.include_router(chapters.router, dependencies=[Depends(verify_admin_token)])
+app.include_router(export.router, dependencies=[Depends(verify_admin_token)])
+app.include_router(stream.router, dependencies=[Depends(verify_admin_token)])
+# settings 路由：status 检查不需要鉴权（首次配置），但 PUT 需要
+app.include_router(settings_router.router)
 
 
 @app.get("/api/health")

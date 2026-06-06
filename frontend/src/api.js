@@ -1,11 +1,24 @@
 const BASE = "";
+const ADMIN_TOKEN = localStorage.getItem("novel-admin-token") || "novel-agent-2026";
 
 async function request(path, options = {}) {
+  const headers = { "Content-Type": "application/json", "X-Admin-Token": ADMIN_TOKEN, ...options.headers };
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...options.headers },
+    headers,
     ...options,
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      // 提示用户输入 token
+      const token = prompt("请输入管理员 Token：");
+      if (token) {
+        localStorage.setItem("novel-admin-token", token);
+        // 重试
+        headers["X-Admin-Token"] = token;
+        return request(path, { ...options, headers });
+      }
+      throw new Error("未授权");
+    }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || `请求失败 (${res.status})`);
   }

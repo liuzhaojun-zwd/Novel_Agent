@@ -1,11 +1,20 @@
 """Novel_Agent — 设置路由（前端可配置 LLM API）"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
-from app.config import set_llm_config, is_llm_configured, get_llm_config
+from app.config import set_llm_config, is_llm_configured, get_llm_config, mask_api_key, settings
+from app.routers import jobs  # reuse verify_admin_token via manual check
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+
+# ── 鉴权检查 ──
+def _check_token(request: Request):
+    """手动检查 admin token（PUT 操作需要鉴权）"""
+    token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
+    if not token or token != settings.admin_token:
+        raise HTTPException(status_code=401, detail="未授权")
 
 
 class LLMConfigRequest(BaseModel):
@@ -21,6 +30,7 @@ async def get_llm_settings():
     cfg = get_llm_config()
     return {
         "base_url": cfg["base_url"],
+        "api_key_masked": mask_api_key(cfg["api_key"]),
         "api_key_configured": bool(cfg["api_key"]),
         "model": cfg["model"],
         "temperature": cfg["temperature"],
@@ -28,8 +38,9 @@ async def get_llm_settings():
 
 
 @router.put("/llm")
-async def update_llm_settings(req: LLMConfigRequest):
-    """更新 LLM 配置"""
+async def update_llm_settings(request: Request, req: LLMConfigRequest):
+    """更新 LLM 配置（需要鉴权）"""
+    _check_token(request)
     kwargs = {"api_key": req.api_key}
     if req.base_url:
         kwargs["base_url"] = req.base_url

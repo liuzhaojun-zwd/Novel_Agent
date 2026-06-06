@@ -1,10 +1,10 @@
-"""Novel_Agent — 大纲相关路由（支持流式生成）"""
+"""Novel_Agent — 大纲相关路由（支持流式生成，带并发保护）"""
 
 import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from app.models import OutlineModifyRequest
 from app.services import job_service as svc
 from app.services.outline_generator import generate_outline_stream
@@ -16,19 +16,26 @@ logger = logging.getLogger("novel_agent.outline")
 
 
 @router.post("/generate-outline")
-async def trigger_generate_outline(job_id: str):
-    """触发大纲生成（后台流式任务）"""
+async def trigger_generate_outline(job_id: str, request: Request):
+    """触发大纲生成（后台流式任务，带并发保护）"""
+    # 鉴权已通过全局依赖，额外检查是否有活跃大纲任务
     job = await svc.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
     if job.status not in ("pending",):
         raise HTTPException(status_code=400, detail=f"当前状态 {job.status} 不允许生成大纲")
 
+    # 防止重复触发
+    from app.services.job_locks import is_task_active, register_task
+    if is_task_active(job_id):
+        raise HTTPException(status_code=429, detail="已有生成任务正在运行")
+
     # 锁状态
     await svc.update_job_status(job_id, "generating_outline")
 
     # 后台异步生成大纲
-    asyncio.create_task(_run_outline_generation(job_id, job))
+    task = asyncio.create_task(_run_outline_generation(job_id, job))
+    register_task(job_id, task)
 
     return {"message": "大纲生成已启动", "job_id": job_id}
 

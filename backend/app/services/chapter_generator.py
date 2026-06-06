@@ -21,8 +21,17 @@ from app.models import SetupCreate
 
 logger = logging.getLogger("novel_agent.chapter")
 
-# 分段生成：每段目标 ~500 字
-_SEGMENT_TARGET_CHARS = 500
+# 分段生成：每段目标字数动态计算，最小800最大2000
+def _get_segment_target(target_words: int) -> int:
+    return max(800, min(2000, target_words // 4))
+
+# 最大分段数动态计算，确保有足够分段空间
+def _get_max_segments(target_words: int) -> int:
+    seg_target = _get_segment_target(target_words)
+    return max(8, target_words // seg_target + 2)
+
+# 字数达标阈值（80%视为达标）
+_WORD_THRESHOLD = 0.8
 
 CHAPTER_PROMPT_TEMPLATE = """你是一位专业小说作家，请根据以下设定和章节大纲，创作一篇小说的章节正文。
 
@@ -130,6 +139,8 @@ async def _generate_single_chapter(
     full_content = ""
     segment = 0
     target_char_count = setup.words_per_chapter
+    segment_target = _get_segment_target(target_char_count)
+    max_segments = _get_max_segments(target_char_count)
 
     while True:
         # 构造当前段的 prompt
@@ -178,8 +189,8 @@ async def _generate_single_chapter(
         if char_count >= target_char_count:
             break
 
-        # 防止死循环（最多 6 段）
-        if segment >= 6:
+        # 防止死循环（动态最大分段数）
+        if segment >= max_segments:
             break
 
     char_count = len(full_content.replace(" ", "").replace("\n", ""))
@@ -294,7 +305,7 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
             # 有段级 checkpoint，从已有内容继续
             full_content = saved_content
             current_chars = len(full_content.replace(" ", "").replace("\n", ""))
-            if current_chars >= setup.words_per_chapter * 0.9:
+            if current_chars >= setup.words_per_chapter * _WORD_THRESHOLD:
                 # 已足够，直接完成
                 pass
             else:
@@ -332,7 +343,7 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
 
         # ── 字数校验 & 重试 ──
         retries = 0
-        while retries < 3 and char_count < setup.words_per_chapter * 0.5:
+        while retries < 3 and char_count < setup.words_per_chapter * _WORD_THRESHOLD:
             await publish(job_id, "progress",
                           chapter=chapter_num, total=job.chapter_count,
                           status="generating_chapters",
@@ -345,7 +356,7 @@ async def generate_chapters(job_id: str, up_to: int | None = None):
             )
             char_count = len(full_content.replace(" ", "").replace("\n", ""))
 
-        if char_count < setup.words_per_chapter * 0.5:
+        if char_count < setup.words_per_chapter * _WORD_THRESHOLD:
             await svc.update_job_status(job_id, "failed")
             await publish(job_id, "error",
                           chapter=chapter_num,

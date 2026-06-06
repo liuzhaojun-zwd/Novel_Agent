@@ -1,51 +1,27 @@
-"""Novel_Agent — 数据库初始化与管理"""
+"""Novel_Agent — 数据库初始化与管理（连接池化）"""
 
 import aiosqlite
 from contextlib import asynccontextmanager
 from pathlib import Path
 from app.config import settings
 
+# 模块级持久连接
+_db_conn: aiosqlite.Connection | None = None
 
-async def _get_conn() -> aiosqlite.Connection:
-    """创建新数据库连接（低层函数）"""
+
+async def init_db() -> aiosqlite.Connection:
+    """初始化数据库表结构并返回持久连接（lifespan 中调用）"""
     db_path = Path(settings.database_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(db_path))
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA foreign_keys=ON")
-    return db
 
+    global _db_conn
+    _db_conn = await aiosqlite.connect(str(db_path))
+    _db_conn.row_factory = aiosqlite.Row
+    await _db_conn.execute("PRAGMA journal_mode=WAL")
+    await _db_conn.execute("PRAGMA foreign_keys=ON")
 
-@asynccontextmanager
-async def get_db():
-    """安全的数据库连接上下文管理器。
-    
-    用法：
-        async with get_db() as db:
-            cursor = await db.execute(...)
-    """
-    db = await _get_conn()
-    try:
-        yield db
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-    finally:
-        await db.close()
-
-
-# 兼容旧版直接调用（内部仍走上下文管理器）
-async def get_db_conn() -> aiosqlite.Connection:
-    """（已弃用）临时连接，请使用 async with get_db() as db: 替代"""
-    return await _get_conn()
-
-
-async def init_db():
-    """初始化数据库表结构"""
-    async with get_db() as db:
-        await db.executescript("""
+    # 创建表
+    await _db_conn.executescript("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'pending'
@@ -84,11 +60,43 @@ async def init_db():
                 UNIQUE(job_id, chapter_number)
             );
         """)
-        # 迁移：为已有数据库添加新列（幂等）
-        for col_sql in [
-            "ALTER TABLE jobs ADD COLUMN feedback TEXT DEFAULT '[]'",
-        ]:
-            try:
-                await db.execute(col_sql)
-            except Exception:
-                pass
+    # 迁移：幂等添加新列
+    for col_sql in [
+        "ALTER TABLE jobs ADD COLUMN feedback TEXT DEFAULT '[]'",
+    ]:
+        try:
+            await _db_conn.execute(col_sql)
+        except Exception:
+            pass
+
+    await _db_conn.commit()
+    return _db_conn
+
+
+async def close_db(conn: aiosqlite.Connection):
+    """关闭持久连接（lifespan 退出时调用）"""
+    global _db_conn
+    if conn:
+        await conn.close()
+    _db_conn = None
+
+
+@asynccontextmanager
+async def get_db():
+    """获取持久连接的上下文管理器（commit/rollback，不再每次 open/close）。"""
+    if _db_conn is None:
+        raise RuntimeError("数据库未初始化，请先调用 init_db()")
+    try:
+        yield _db_conn
+        await _db_conn.commit()
+    except Exception:
+        await _db_conn.rollback()
+        raise
+
+
+# 兼容旧版
+async def get_db_conn() -> aiosqlite.Connection:
+    """（已弃用）返回持久连接，请使用 async with get_db() as db: 替代"""
+    if _db_conn is None:
+        raise RuntimeError("数据库未初始化，请先调用 init_db()")
+    return _db_conn

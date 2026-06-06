@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.8
+    llm_context_window: int = 1000000
+
+    # Admin auth
+    admin_token: str = "novel-agent-2026"
 
     # Database（支持通过环境变量覆盖，测试用）
     database_path: str = os.environ.get(
@@ -50,7 +54,9 @@ def get_llm_config() -> dict:
         "base_url": _runtime_llm["base_url"] or settings.llm_base_url,
         "api_key": _runtime_llm["api_key"] or settings.llm_api_key,
         "model": _runtime_llm["model"] or settings.llm_model,
-        "temperature": _runtime_llm["temperature"] or settings.llm_temperature,
+        # 修复 temperature=0 被吞值：用 is not None 判断而非 or
+        "temperature": (_runtime_llm["temperature"] if _runtime_llm["temperature"] is not None
+                        else settings.llm_temperature),
     }
     return cfg
 
@@ -60,6 +66,15 @@ def set_llm_config(**kwargs):
     for k in ("base_url", "api_key", "model", "temperature"):
         if k in kwargs and kwargs[k] is not None:
             _runtime_llm[k] = kwargs[k]
+
+
+def mask_api_key(key: str) -> str:
+    """掩码显示 API key，只露首尾"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return key[:3] + "..." + key[-2:]
+    return key[:5] + "..." + key[-3:]
 
 
 def is_llm_configured() -> bool:

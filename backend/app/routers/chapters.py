@@ -123,12 +123,12 @@ async def _start_generation_internal(job_id: str, up_to: int | None, mode: str):
         # 锁状态
         await svc.update_job_status(job_id, "generating_chapters")
 
+        # 在锁保护内启动后台任务 + 注册（修复竞态窗口）
+        task = asyncio.create_task(_run_and_cleanup(job_id, up_to))
+        register_task(job_id, task)
+
     finally:
         release_job_lock(job_id)
-
-    # 启动后台任务（锁已释放，但 task 注册防止重复启动）
-    task = asyncio.create_task(_run_and_cleanup(job_id, up_to))
-    register_task(job_id, task)
 
     desc = f"最多生成到第{up_to}章" if up_to else "生成剩余全部"
     return {"message": f"正文生成已启动（{desc}）", "job_id": job_id}
