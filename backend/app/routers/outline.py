@@ -101,7 +101,7 @@ async def get_outline(job_id: str):
 
 @router.put("/outline")
 async def modify_outline(job_id: str, req: OutlineModifyRequest):
-    """修改大纲（自然语言指令）"""
+    """修改大纲（自然语言指令，LLM辅助理解复杂修改）"""
     job = await svc.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -114,6 +114,7 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
     import re
     modified = False
 
+    # ── 层1：简单正则匹配（零成本，不需要LLM调用）──
     # 匹配 "第N章标题改为xxx"
     m = re.search(r"第(\d+)章标题改为[：:：]?\s*(.+)", instruction)
     if m:
@@ -130,8 +131,52 @@ async def modify_outline(job_id: str, req: OutlineModifyRequest):
             outline[idx]["summary"] = m.group(2).strip()
             modified = True
 
+    # ── 层2：LLM辅助修改（正则无法匹配的复杂指令）──
     if not modified:
-        raise HTTPException(status_code=400, detail="无法解析修改指令，请使用如'第3章标题改为xxx'的格式")
+        from app.services.llm_adapter import LLMAdapter
+        llm = LLMAdapter()
+        outline_str = json.dumps(outline, ensure_ascii=False, indent=2)
+        llm_prompt = f"""你是一位小说大纲编辑助手。用户希望修改大纲，请根据用户的指令返回修改后的完整大纲 JSON。
+
+当前大纲：
+{outline_str}
+
+用户修改指令：{instruction}
+
+要求：
+1. 根据指令修改大纲中对应的章节
+2. 保持其他未涉及的章节不变
+3. 返回完整修改后的 JSON，格式与输入一致
+4. 只输出 JSON，不要输出其他内容
+
+输出格式：
+{{"chapters": [{{"chapter_number": 1, "title": "...", "summary": "..."}}, ...]}}"""
+
+        messages = [
+            {"role": "system", "content": "你是一位小说大纲编辑助手，擅长根据用户意图修改大纲。请始终输出 JSON。"},
+            {"role": "user", "content": llm_prompt},
+        ]
+
+        try:
+            result = await llm.chat_json(messages, max_tokens=8192)
+            new_chapters = result.get("chapters", [])
+            if new_chapters and len(new_chapters) == len(outline):
+                # 验证每个章节都有必需字段
+                for ch in new_chapters:
+                    if not all(k in ch for k in ("chapter_number", "title", "summary")):
+                        raise ValueError("LLM返回的大纲缺少必需字段")
+                outline = new_chapters
+                modified = True
+                logger.info(f"LLM辅助大纲修改成功: job={job_id[:8]} instruction={instruction[:30]}")
+            else:
+                logger.warning(f"LLM返回大纲章数不匹配: expected={len(outline)} got={len(new_chapters)}")
+        except Exception as e:
+            logger.error(f"LLM辅助大纲修改失败: {e}")
+            # LLM失败时回退到提示用户用简单格式
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法理解修改指令「{instruction}」，LLM辅助修改也失败了。请尝试更明确的格式，如「第3章标题改为xxx」"
+            )
 
     await svc.update_job_status(job_id, "pending", outline=json.dumps(outline, ensure_ascii=False))
 

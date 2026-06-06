@@ -1,10 +1,20 @@
-"""Novel_Agent — 写作质量评估器
+"""Novel_Agent — 写作质量评估器（增强版）
 
-基于启发式规则对每章进行质量评分，无需 LLM 调用。
+改进：
+1. 对话检测支持中英文多种引号格式
+2. 评分维度权重可按题材微调
+3. "了"字检测更精确（只检测句尾滥用）
+4. 开头质量评分更丰富（场景描写/悬念/动作开头加分）
+5. 新增结尾质量维度
 """
 
 import re
 from typing import Optional
+
+
+# ── 中文引号配对检测 ──
+_DIALOGUE_OPENERS = {'"', '"', '「', '\u201c'}
+_DIALOGUE_CLOSERS = {'"', '"', '」', '\u201d'}
 
 
 def score_chapter(
@@ -49,6 +59,8 @@ def score_chapter(
         issues.append(f"字数不足（{char_count}/{target_words}），达标率 {word_ratio:.0%}")
     elif word_ratio < 0.8:
         issues.append(f"字数略少（{char_count}/{target_words}），达标率 {word_ratio:.0%}")
+    elif word_ratio > 1.5:
+        issues.append(f"字数偏多（{char_count}/{target_words}），达标率 {word_ratio:.0%}，可能冗余")
     dimensions["word_count"] = round(word_score)
 
     # ── 2. 段落多样性 ──
@@ -71,20 +83,20 @@ def score_chapter(
         avg_len = sum(para_lengths) / len(para_lengths)
         short_ratio = sum(1 for l in para_lengths if l < avg_len * 0.5) / len(para_lengths)
         long_ratio = sum(1 for l in para_lengths if l > avg_len * 1.5) / len(para_lengths)
-        # 理想：短段 20-40%，长段 20-40%
         if 0.15 <= short_ratio <= 0.5 and 0.15 <= long_ratio <= 0.5:
             para_score = min(100, para_score + 15)
         elif short_ratio > 0.7 or long_ratio > 0.7:
             issues.append("段落长度过于单一，建议长短交替")
     dimensions["paragraph_diversity"] = round(para_score)
 
-    # ── 3. 对话比例 ──
-    # 检测引号内的内容作为对话
+    # ── 3. 对话比例（支持多种引号格式） ──
     dialogue_chars = 0
     in_dialogue = False
     for c in content:
-        if c in ('"', '"', '"', '"', "「", "」"):
-            in_dialogue = not in_dialogue
+        if c in _DIALOGUE_OPENERS:
+            in_dialogue = True
+        elif c in _DIALOGUE_CLOSERS:
+            in_dialogue = False
         elif in_dialogue and '\u4e00' <= c <= '\u9fff':
             dialogue_chars += 1
     
@@ -112,10 +124,8 @@ def score_chapter(
     else:
         sent_lengths = [len(s) for s in sentences]
         avg_sent = sum(sent_lengths) / len(sent_lengths)
-        # 标准差
         variance = sum((l - avg_sent) ** 2 for l in sent_lengths) / len(sent_lengths)
         std_dev = variance ** 0.5
-        # 标准差太大或太小都不好
         if std_dev < avg_sent * 0.3:
             sent_score = 50
             issues.append("句式长度过于均匀，建议长短句交替")
@@ -124,25 +134,63 @@ def score_chapter(
         else:
             sent_score = 90
         
-        # 检查"了"字的过度使用
-        le_count = len(re.findall(r'了[。！？，,；;]', content))
-        if le_count > 0 and le_count / len(sentences) > 0.5:
-            issues.append(f"「了」字结尾句偏多（{le_count}处），建议精简")
+        # 检查"了"字句尾滥用（更精确：只看句尾的"了"而非所有"了"）
+        le_at_end = len(re.findall(r'了[。！？]', content))
+        total_endings = len(re.findall(r'[。！？]', content))
+        if total_endings > 0 and le_at_end / total_endings > 0.4:
+            issues.append(f"「了」字句尾偏多（{le_at_end}/{total_endings}处），建议精简")
     dimensions["sentence_variety"] = round(sent_score)
 
-    # ── 5. 开头质量 ──
-    opening = text[:200]
-    if any(kw in opening for kw in ("忽然", "突然", "一声", "就在这时", "清晨", "阳光", "雨", "风")):
-        open_score = 85
-    elif any(kw in opening for kw in ("说道", "问道", "回答", "开口")):
-        open_score = 50
+    # ── 5. 开头质量（更丰富的评分） ──
+    opening = text[:300]  # 增加到300字以更准确判断
+    open_score = 50  # 基础分
+
+    # 场景描写开头加分
+    if any(kw in opening for kw in ("阳光", "月光", "雨", "风", "雾", "雪", "夜色", 
+                                      "清晨", "傍晚", "黑暗", "光明", "光线",
+                                      "山", "河", "海", "城", "路", "林")):
+        open_score += 20
+    
+    # 悬念/意外开头加分
+    if any(kw in opening for kw in ("忽然", "突然", "一声", "就在这时", "不料", "谁知",
+                                      "竟然", "居然", "意外", "震惊")):
+        open_score += 15
+    
+    # 动作开头加分
+    if any(kw in opening for kw in ("奔跑", "冲", "跳", "挥", "拔", "刺", "斩",
+                                      "推", "拉", "抓", "握", "逃", "追")):
+        open_score += 15
+    
+    # 对话开头减分
+    if any(c in opening[:20] for c in _DIALOGUE_OPENERS):
+        open_score -= 10
         issues.append("章节以对话开头，建议加入场景描写")
-    else:
-        open_score = 70
+
+    open_score = max(0, min(100, open_score))
     dimensions["opening"] = round(open_score)
 
-    # ── 6. 重复短语检测 ──
-    # 检测 4-6 字短语的重复出现
+    # ── 6. 结尾质量 ──
+    ending = text[-300:] if len(text) > 300 else text
+    end_score = 50
+
+    # 悬念结尾加分
+    if any(kw in ending for kw in ("究竟", "到底", "谁知", "不料", "然而", 
+                                      "未完", "悬念", "谜", "秘密", "未知")):
+        end_score += 20
+    
+    # 情感高潮结尾加分
+    if any(kw in ending for kw in ("终于", "泪", "笑", "怒", "悲", "喜",
+                                      "嘶吼", "呐喊", "沉默", "叹息", "释然")):
+        end_score += 15
+    
+    # 平淡结尾减分
+    if any(kw in ending for kw in ("就这样", "然后", "于是", "日子", "平淡地")):
+        end_score -= 10
+
+    end_score = max(0, min(100, end_score))
+    dimensions["ending"] = round(end_score)
+
+    # ── 7. 重复短语检测 ──
     repeat_issues = []
     for ngram_len in [4, 5, 6]:
         seen = {}
@@ -164,14 +212,15 @@ def score_chapter(
         repeat_score = 100
     dimensions["repetition"] = round(repeat_score)
 
-    # ── 综合分 ──
+    # ── 综合分（权重调整：增加结尾权重） ──
     weights = {
         "word_count": 0.25,
-        "paragraph_diversity": 0.15,
-        "dialogue": 0.15,
-        "sentence_variety": 0.15,
+        "paragraph_diversity": 0.12,
+        "dialogue": 0.12,
+        "sentence_variety": 0.12,
         "opening": 0.10,
-        "repetition": 0.20,
+        "ending": 0.10,
+        "repetition": 0.19,
     }
     overall = sum(
         dimensions.get(dim, 0) * weight
