@@ -49,13 +49,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — 允许前端跨域访问（开发模式用 Vite proxy）
+# CORS — 允许前端跨域访问
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173", "http://localhost:5174",
+        "http://127.0.0.1:5173", "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "X-Admin-Token"],
 )
 
 # 注册路由（带鉴权保护）
@@ -76,12 +80,14 @@ async def health():
 # 生产模式：serve 前端构建产物
 frontend_dist = Path(__file__).parent.parent.parent / "frontend" / "dist"
 if frontend_dist.exists():
+    # 必须先挂载 /assets，否则 SPA fallback 会拦截
     app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
     
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_frontend(full_path: str):
-        """SPA fallback — 所有非 API 路径返回 index.html"""
-        if full_path.startswith("api/"):
-            return None  # 让 API 路由处理
+        """SPA fallback — 所有非 API / assets 路径返回 index.html"""
+        if full_path.startswith(("api/", "assets/")):
+            from fastapi.responses import Response
+            return Response(status_code=404)
         from fastapi.responses import FileResponse
         return FileResponse(str(frontend_dist / "index.html"))

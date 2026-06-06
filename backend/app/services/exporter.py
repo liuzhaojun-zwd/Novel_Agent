@@ -1,7 +1,26 @@
-"""Novel_Agent — 导出器"""
+"""Novel_Agent — 导出器（带过期文件清理）"""
+import os
+import time
 from app.database import get_db
 from pathlib import Path
 from app.config import get_data_dir
+
+# 导出文件最大存活时间（秒）
+_EXPORT_FILE_MAX_AGE = 3600  # 1小时后清理
+
+
+async def _cleanup_old_exports():
+    """清理超过存活时间的导出文件"""
+    import asyncio
+    data_dir = get_data_dir()
+    now = time.time()
+    for f in data_dir.iterdir():
+        if f.is_file() and f.suffix in ('.txt', '.md'):
+            if now - f.stat().st_mtime > _EXPORT_FILE_MAX_AGE:
+                try:
+                    os.remove(str(f))
+                except OSError:
+                    pass
 
 
 async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
@@ -9,6 +28,8 @@ async def export_job(job_id: str, fmt: str) -> tuple[str, str, str]:
     导出任务作品。
     返回 (文件路径, 文件名, mime_type)
     """
+    # 先清理旧导出文件
+    await _cleanup_old_exports()
     async with get_db() as db:
         cursor = await db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
         job = await cursor.fetchone()

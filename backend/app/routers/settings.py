@@ -4,7 +4,6 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
 from app.config import set_llm_config, is_llm_configured, get_llm_config, mask_api_key, settings
-from app.routers import jobs  # reuse verify_admin_token via manual check
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 

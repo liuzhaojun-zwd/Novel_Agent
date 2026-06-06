@@ -63,7 +63,20 @@ SEGMENT_PROMPT_SUFFIX = """
 
 ---
 
-⚠️ 注意：以上为本章节的一部分内容。请继续创作下一段正文，保持与上文的连贯性。当前已写约 {written_chars} 字，目标约 {target_words} 字。请继续，不要重复已写的内容。"""
+⚠️ 注意：以上为本章节的一部分内容。请继续创作下一段正文，保持与上文的连贯性。当前已写约 {written_chars} 字，目标约 {target_words} 字。请继续，不要重复已写的内容。
+
+以下是本章已写的内容摘要（供你参考，不要重复）：
+{written_content_summary}"""
+
+
+def _truncate_for_context(text: str, max_chars: int = 1500) -> str:
+    """截取已写内容的摘要放进续段prompt（避免全文过长撑爆上下文）"""
+    if len(text) <= max_chars:
+        return text
+    # 保留开头和结尾
+    head = text[:max_chars // 2]
+    tail = text[-(max_chars // 3):]
+    return head + "\n\n……（中间省略）……\n\n" + tail
 
 
 def build_chapter_prompt(
@@ -147,9 +160,12 @@ async def _generate_single_chapter(
         if segment == 0:
             prompt = main_prompt
         else:
+            # 把已写内容的摘要放进续段prompt（LLM能看到上文）
+            written_summary = _truncate_for_context(full_content, 1500)
             prompt = main_prompt + SEGMENT_PROMPT_SUFFIX.format(
                 written_chars=len(full_content.replace(" ", "").replace("\n", "")),
                 target_words=target_char_count,
+                written_content_summary=written_summary,
             )
 
         messages = [
