@@ -1,54 +1,48 @@
-"""Novel_Agent — LLM Adapter：统一 OpenAI API 格式调用
+"""OpenAI-compatible LLM adapter with pooled HTTP, routing, retries and metrics."""
 
-增强：指数退避重试 + 429 处理 + 简易熔断
-"""
-import httpx
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
 import time
-import asyncio
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
+from urllib.parse import urlparse
+
+import httpx
+
 from app.config import get_llm_config
+from app.services import llm_cache, llm_metrics
+from app.services.model_router import select_model
+from app.services.prompt_registry import get_prompt_version, template_hash
 
 logger = logging.getLogger("novel_agent.llm")
-
-# ── 重试 & 熔断 ──
 _MAX_RETRIES = 3
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-_RETRY_BASE_DELAY = 2.0  # 秒
-
-# 熔断：连续失败计数
-_consecutive_failures = 0
-_CIRCUIT_BREAK_THRESHOLD = 5
-_CIRCUIT_BREAK_COOLDOWN = 60.0  # 秒
-_circuit_break_until = 0.0
+_RETRY_BASE_DELAY = 2.0
+_http_client: httpx.AsyncClient | None = None
 
 
-def _is_circuit_open() -> bool:
-    """熔断器是否打开"""
-    if _consecutive_failures < _CIRCUIT_BREAK_THRESHOLD:
-        return False
-    if time.time() < _circuit_break_until:
-        return True
-    # 冷却期结束，半开
-    return False
+async def init_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=20.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        )
+    return _http_client
 
 
-def _record_success():
-    """记录成功调用，重置熔断计数"""
-    global _consecutive_failures
-    _consecutive_failures = 0
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
-def _record_failure():
-    """记录失败调用，触发熔断"""
-    global _consecutive_failures, _circuit_break_until
-    _consecutive_failures += 1
-    if _consecutive_failures >= _CIRCUIT_BREAK_THRESHOLD:
-        _circuit_break_until = time.time() + _CIRCUIT_BREAK_COOLDOWN
-        logger.warning(f"熔断触发：连续失败{_consecutive_failures}次，暂停{_CIRCUIT_BREAK_COOLDOWN}s")
-
-
+def _estimate_tokens(messages: list[dict], content: str) -> tuple[int, int]:
+    input_chars = sum(len(str(message.get("content", ""))) for message in messages)
+    return max(1, round(input_chars * 1.2)), max(1, round(len(content) * 1.5))
 class LLMAdapter:
     def __init__(
         self,
@@ -56,209 +50,230 @@ class LLMAdapter:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        *,
+        purpose: str = "default",
+        prompt_id: str | None = None,
+        job_id: str | None = None,
     ):
         cfg = get_llm_config()
         self.base_url = base_url or cfg["base_url"]
         self.api_key = api_key or cfg["api_key"]
-        self.model = model or cfg["model"]
-        # 修复 temperature=0 吞值
-        self.temperature = (temperature if temperature is not None else cfg["temperature"])
+        self.requested_model = model
+        self.temperature = temperature if temperature is not None else cfg["temperature"]
+        self.purpose = purpose
+        self.prompt_id = prompt_id or purpose
+        self.job_id = job_id
+        route = select_model(purpose, model)
+        self.model = route["model"]
+
+    def _metadata(self, messages: list[dict], purpose: str | None, prompt_id: str | None) -> dict:
+        selected_purpose = purpose or self.purpose
+        selected_prompt = prompt_id or self.prompt_id or selected_purpose
+        route = select_model(selected_purpose, self.requested_model)
+        cfg = get_llm_config()
+        return {
+            "purpose": selected_purpose,
+            "prompt_id": selected_prompt,
+            "prompt_version": get_prompt_version(selected_prompt),
+            "template_hash": template_hash(messages),
+            "model": route["model"],
+            "model_tier": route["tier"],
+            "input_rate": route["input_cost_per_million"],
+            "output_rate": route["output_cost_per_million"],
+            "provider": urlparse(cfg["base_url"]).netloc or "openai-compatible",
+        }
+
+    async def _record(self, meta: dict, **values) -> None:
+        try:
+            await llm_metrics.record_call(job_id=self.job_id, **meta, **values)
+        except Exception as exc:
+            logger.warning("llm_metric_write_failed error=%s", exc)
 
     async def chat(
         self,
         messages: list[dict],
         response_format: Optional[dict] = None,
         max_tokens: int = 8192,
+        *,
+        purpose: str | None = None,
+        prompt_id: str | None = None,
+        cache_category: str | None = None,
     ) -> str:
-        """调用 LLM chat completion（非流式），带指数退避重试"""
-        # 熔断检查
-        if _is_circuit_open():
-            raise RuntimeError(f"LLM 熔断中，请等待{_CIRCUIT_BREAK_COOLDOWN}s后重试")
-
-        t0 = time.time()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        meta = self._metadata(messages, purpose, prompt_id)
+        cache_input = json.dumps(
+            {"messages": messages, "temperature": self.temperature, "response_format": response_format},
+            ensure_ascii=False, sort_keys=True,
+        )
+        if cache_category:
+            cached = llm_cache.get_cached(
+                cache_input, meta["model"], category=cache_category,
+                prompt_version=meta["prompt_version"],
+            )
+            if cached is not None:
+                input_tokens, output_tokens = _estimate_tokens(messages, cached)
+                await self._record_usage(meta, input_tokens, output_tokens, 0, 0, True, True)
+                return cached
         body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": max_tokens,
+            "model": meta["model"], "messages": messages,
+            "temperature": self.temperature, "max_tokens": max_tokens,
         }
         if response_format:
             body["response_format"] = response_format
-
-        prompt_preview = messages[-1]["content"][:80] if messages else ""
-
+        started = time.perf_counter()
+        client = await init_http_client()
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                async with httpx.AsyncClient(timeout=180.0) as client:
-                    resp = await client.post(
-                        f"{self.base_url.rstrip('/')}/chat/completions",
-                        headers=headers,
-                        json=body,
-                    )
-
-                if resp.status_code in _RETRYABLE_STATUS_CODES:
-                    retry_after = float(resp.headers.get("Retry-After", _RETRY_BASE_DELAY * (2 ** (attempt - 1))))
-                    logger.warning(f"LLM 可重试错误: status={resp.status_code} attempt={attempt}/{_MAX_RETRIES} retry_after={retry_after}s")
-                    if attempt < _MAX_RETRIES:
-                        await asyncio.sleep(retry_after)
-                        continue
-                    # 最后一次重试也失败
-                    resp.raise_for_status()
-
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                elapsed = time.time() - t0
-                logger.info(f"LLM chat OK: model={self.model} tok={max_tokens} "
-                           f"elapsed={elapsed:.1f}s len={len(content)} "
-                           f"attempt={attempt} prompt={prompt_preview}...")
-                _record_success()
-                return content
-
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code not in _RETRYABLE_STATUS_CODES:
-                    # 非可重试错误（401/403等），直接失败
-                    elapsed = time.time() - t0
-                    logger.error(f"LLM chat FAIL (non-retryable): model={self.model} status={e.response.status_code} "
-                                 f"elapsed={elapsed:.1f}s prompt={prompt_preview}...")
-                    _record_failure()
-                    raise
-                # 可重试错误已在上面处理
-                elapsed = time.time() - t0
-                logger.error(f"LLM chat FAIL after {_MAX_RETRIES} retries: model={self.model} "
-                             f"elapsed={elapsed:.1f}s prompt={prompt_preview}...")
-                _record_failure()
-                raise
-
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(f"LLM 网络/超时错误: {type(e).__name__} attempt={attempt}/{_MAX_RETRIES} delay={delay}s")
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(delay)
+                response = await client.post(
+                    f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=self._headers(), json=body,
+                )
+                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
+                    await asyncio.sleep(self._retry_delay(response, attempt))
                     continue
-                elapsed = time.time() - t0
-                logger.error(f"LLM chat FAIL after {_MAX_RETRIES} retries (timeout/connect): "
-                             f"elapsed={elapsed:.1f}s prompt={prompt_preview}...")
-                _record_failure()
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                usage = data.get("usage") or {}
+                estimated = not bool(usage)
+                input_tokens, output_tokens = (
+                    (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                    if usage else _estimate_tokens(messages, content)
+                )
+                latency_ms = round((time.perf_counter() - started) * 1000)
+                await self._record_usage(
+                    meta, input_tokens, output_tokens, latency_ms, attempt, estimated, False,
+                    response.headers.get("x-request-id") or data.get("id"),
+                )
+                if cache_category:
+                    llm_cache.set_cache(
+                        cache_input, meta["model"], content, category=cache_category,
+                        prompt_version=meta["prompt_version"],
+                    )
+                logger.info(
+                    "llm_call status=ok purpose=%s model=%s tier=%s latency_ms=%s attempt=%s",
+                    meta["purpose"], meta["model"], meta["model_tier"], latency_ms, attempt,
+                )
+                return content
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as exc:
+                retryable = not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code in _RETRYABLE_STATUS_CODES
+                if retryable and attempt < _MAX_RETRIES:
+                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+                await self._record(
+                    meta, status="error", attempt_count=attempt,
+                    latency_ms=round((time.perf_counter() - started) * 1000),
+                    error_code=type(exc).__name__,
+                )
                 raise
+        raise RuntimeError("LLM 调用重试耗尽")
 
-            except Exception as e:
-                elapsed = time.time() - t0
-                logger.error(f"LLM chat FAIL (unexpected): model={self.model} elapsed={elapsed:.1f}s "
-                             f"error={e} prompt={prompt_preview}...")
-                _record_failure()
-                raise
-
-    async def chat_json(self, messages: list[dict], max_tokens: int = 8192) -> dict:
-        """调用 LLM 并返回 JSON 格式结果"""
+    async def chat_json(self, messages: list[dict], max_tokens: int = 8192, **kwargs) -> dict:
         content = await self.chat(
-            messages=messages,
-            response_format={"type": "json_object"},
-            max_tokens=max_tokens,
+            messages, response_format={"type": "json_object"}, max_tokens=max_tokens, **kwargs,
         )
         return json.loads(content)
-
     async def chat_stream(
         self,
         messages: list[dict],
         max_tokens: int = 8192,
         response_format: Optional[dict] = None,
+        *,
+        purpose: str | None = None,
+        prompt_id: str | None = None,
     ) -> AsyncGenerator[str, None]:
-        """调用 LLM 并流式返回 token 片段。带重试（连接阶段）。"""
-        # 熔断检查
-        if _is_circuit_open():
-            raise RuntimeError(f"LLM 熔断中，请等待{_CIRCUIT_BREAK_COOLDOWN}s后重试")
-
-        t0 = time.time()
-        total_chars = 0
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        meta = self._metadata(messages, purpose, prompt_id)
         body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
+            "model": meta["model"], "messages": messages, "temperature": self.temperature,
+            "max_tokens": max_tokens, "stream": True,
         }
         if response_format:
             body["response_format"] = response_format
-
-        prompt_preview = messages[-1]["content"][:80] if messages else ""
-
-        # 连接阶段重试（stream 建立后不再重试）
+        started = time.perf_counter()
+        content_parts: list[str] = []
+        usage: dict = {}
+        client = await init_http_client()
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url.rstrip('/')}/chat/completions",
-                        headers=headers,
-                        json=body,
-                    ) as resp:
-                        # 连接阶段的 HTTP 错误
-                        if resp.status_code in _RETRYABLE_STATUS_CODES:
-                            retry_after = float(resp.headers.get("Retry-After", _RETRY_BASE_DELAY * (2 ** (attempt - 1))))
-                            logger.warning(f"LLM stream 可重试错误: status={resp.status_code} attempt={attempt} retry_after={retry_after}s")
-                            if attempt < _MAX_RETRIES:
-                                await asyncio.sleep(retry_after)
-                                continue
-                            resp.raise_for_status()
-
-                        resp.raise_for_status()
-                        # 连接成功，开始流式读取
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data: "):
-                                continue
-                            payload = line[6:].strip()
-                            if payload == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(payload)
-                                delta = chunk["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    total_chars += len(content)
-                                    yield content
-                            except (json.JSONDecodeError, KeyError, IndexError):
-                                continue
-
-                elapsed = time.time() - t0
-                logger.info(f"LLM stream OK: model={self.model} tok={max_tokens} "
-                           f"elapsed={elapsed:.1f}s chars={total_chars} "
-                           f"attempt={attempt} prompt={prompt_preview}...")
-                _record_success()
-                return  # stream 正常结束
-
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code not in _RETRYABLE_STATUS_CODES:
-                    _record_failure()
-                    raise
-                # 可重试的已在上面处理了（attempt == _MAX_RETRIES 时 raise）
-                elapsed = time.time() - t0
-                logger.error(f"LLM stream FAIL after {_MAX_RETRIES} retries: status={e.response.status_code}")
-                _record_failure()
-                raise
-
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(f"LLM stream 网络/超时: {type(e).__name__} attempt={attempt} delay={delay}s")
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(delay)
+                async with client.stream(
+                    "POST", f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=self._headers(), json=body,
+                ) as response:
+                    if response.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
+                        await response.aread()
+                        await asyncio.sleep(self._retry_delay(response, attempt))
+                        continue
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[6:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                            if chunk.get("usage"):
+                                usage = chunk["usage"]
+                            text = chunk["choices"][0].get("delta", {}).get("content", "")
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if text:
+                            content_parts.append(text)
+                            yield text
+                content = "".join(content_parts)
+                estimated = not bool(usage)
+                input_tokens, output_tokens = (
+                    (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                    if usage else _estimate_tokens(messages, content)
+                )
+                latency_ms = round((time.perf_counter() - started) * 1000)
+                await self._record_usage(
+                    meta, input_tokens, output_tokens, latency_ms, attempt, estimated, False,
+                    response.headers.get("x-request-id"),
+                )
+                logger.info(
+                    "llm_stream status=ok purpose=%s model=%s latency_ms=%s attempt=%s chars=%s",
+                    meta["purpose"], meta["model"], latency_ms, attempt, len(content),
+                )
+                return
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as exc:
+                retryable = not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code in _RETRYABLE_STATUS_CODES
+                if retryable and attempt < _MAX_RETRIES and not content_parts:
+                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
                     continue
-                elapsed = time.time() - t0
-                logger.error(f"LLM stream FAIL after {_MAX_RETRIES} retries: {type(e).__name__}")
-                _record_failure()
+                await self._record(
+                    meta, status="error", attempt_count=attempt,
+                    latency_ms=round((time.perf_counter() - started) * 1000),
+                    error_code=type(exc).__name__,
+                )
                 raise
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-            except Exception as e:
-                elapsed = time.time() - t0
-                logger.error(f"LLM stream FAIL: model={self.model} elapsed={elapsed:.1f}s "
-                            f"error={e} prompt={prompt_preview}... chars_before_error={total_chars}")
-                _record_failure()
-                raise
+    @staticmethod
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        try:
+            return min(60.0, float(response.headers.get("Retry-After", 0))) or _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        except ValueError:
+            return _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+
+    async def _record_usage(
+        self,
+        meta: dict,
+        input_tokens: int,
+        output_tokens: int,
+        latency_ms: int,
+        attempt: int,
+        estimated: bool,
+        cache_hit: bool,
+        provider_request_id: str | None = None,
+    ) -> None:
+        cost = (
+            input_tokens * meta["input_rate"] + output_tokens * meta["output_rate"]
+        ) / 1_000_000
+        ledger_meta = {key: value for key, value in meta.items() if key not in {"input_rate", "output_rate"}}
+        await self._record(
+            ledger_meta, status="ok", input_tokens=input_tokens, output_tokens=output_tokens,
+            cost_usd=cost, usage_estimated=estimated, cache_hit=cache_hit,
+            attempt_count=max(1, attempt), latency_ms=latency_ms,
+            provider_request_id=provider_request_id,
+        )

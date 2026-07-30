@@ -1,45 +1,49 @@
 """Novel_Agent — FastAPI 应用入口"""
 
-import logging
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from starlette.responses import Response
 
 from app.database import init_db, close_db
 from app.log_config import setup_logging, get_logger
 from app.config import settings
-from app.routers import jobs, outline, chapters, export, stream, settings as settings_router
+from app.routers import auth, jobs, outline, chapters, export, stream, versions, settings as settings_router
+from app.services.auth_service import authorize_request
 
 logger = get_logger("main")
 
 
-# ── 鉴权依赖 ──
-async def verify_admin_token(request: Request):
-    """验证管理员 Token（从 header 或 query param）"""
-    token = request.headers.get("X-Admin-Token") or request.query_params.get("token")
-    if not token or token != settings.admin_token:
-        raise HTTPException(status_code=401, detail="未授权：请提供有效的 X-Admin-Token")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时初始化
     setup_logging()
     db = await init_db()
-    logger.info("Novel_Agent 启动完成")
-
     from app.config import get_llm_config
-    cfg = get_llm_config()
-    logger.info(f"LLM 配置: model={cfg['model']}, base_url={cfg['base_url']}")
-    logger.info(f"API Key 已配置: {bool(cfg['api_key'])}")
-    logger.info(f"Admin Token: {settings.admin_token[:4]}...")
+    from app.services.llm_adapter import close_http_client, init_http_client
+    from app.services.task_worker import TaskWorker
 
-    yield
-    await close_db(db)
-    logger.info("Novel_Agent 关闭")
+    await init_http_client()
+    cfg = get_llm_config()
+    logger.info(
+        "service_started model=%s fast_model=%s quality_model=%s base_url=%s",
+        cfg["model"], cfg["fast_model"], cfg["quality_model"], cfg["base_url"],
+    )
+    worker = TaskWorker() if settings.task_worker_enabled else None
+    try:
+        async with asyncio.TaskGroup() as group:
+            if worker:
+                group.create_task(worker.run())
+            try:
+                yield
+            finally:
+                if worker:
+                    worker.stop()
+    finally:
+        await close_http_client()
+        await close_db(db)
+        logger.info("service_stopped")
 
 
 app = FastAPI(
@@ -59,16 +63,21 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type", "X-Admin-Token"],
+    allow_headers=["Content-Type"],
 )
 
-# 注册路由（带鉴权保护）
-app.include_router(jobs.router, dependencies=[Depends(verify_admin_token)])
-app.include_router(outline.router, dependencies=[Depends(verify_admin_token)])
-app.include_router(chapters.router, dependencies=[Depends(verify_admin_token)])
-app.include_router(export.router, dependencies=[Depends(verify_admin_token)])
-app.include_router(stream.router, dependencies=[Depends(verify_admin_token)])
-# settings 路由：status 检查不需要鉴权（首次配置），但 PUT 需要
+# Auth endpoints are public; all job resources require a user and project membership.
+from app.routers import memory
+
+app.include_router(auth.router)
+job_dependencies = [Depends(authorize_request)]
+app.include_router(jobs.router, dependencies=job_dependencies)
+app.include_router(outline.router, dependencies=job_dependencies)
+app.include_router(chapters.router, dependencies=job_dependencies)
+app.include_router(versions.router, dependencies=job_dependencies)
+app.include_router(memory.router, dependencies=job_dependencies)
+app.include_router(export.router, dependencies=job_dependencies)
+app.include_router(stream.router, dependencies=job_dependencies)
 app.include_router(settings_router.router)
 
 

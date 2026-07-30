@@ -42,7 +42,8 @@ _NON_NAME_SECOND = set(
 
 # ── 需排除的常见双字词（扩展版 + 小说高频词） ──
 _EXCLUDE = {
-    "时候","地方","东西","事情","问题","办法","样子","声音","表情",
+    "时候","时间","地方","东西","事情","问题","办法","样子","声音","表情",
+    "林中","从远",
     "眼神","心中","脸上","头上","身上","手上","脚下","面前","眼前",
     "背后","身后","周围","旁边","楼下","楼上","门外","窗外","路边",
     "床上","地上","墙上","路上","街上","怀里","手中","沉默","点头",
@@ -90,9 +91,9 @@ _EXCLUDE = {
     "沉思","冥想","遐想","联想","回想","追忆","缅怀","懊悔","遗憾",
 }
 
-# ── 人物出现消失追踪的间隔阈值 ──
-# 之前是3章太低（很多小说人物隔几章自然出场），改为5章
-_CHARACTER_HIATUS_THRESHOLD = 5
+# ── 人物重新出现告警的间隔阈值 ──
+# 相隔超过3章再次出现时提醒作者确认，属于提示而非硬性冲突。
+_CHARACTER_HIATUS_THRESHOLD = 3
 
 # ── 关键事件关键词（用于跨章节追踪） ──
 _KEY_EVENT_VERBS = {
@@ -144,6 +145,12 @@ async def check_consistency(
     seen_names = set()
     character_events = {}
 
+    # 已知人物使用精确名称直接识别，避免滑动 2/3 字窗口产生别名和漏记。
+    for character in known_characters:
+        canonical_name = character.strip()
+        if canonical_name and canonical_name in content:
+            seen_names.add(canonical_name)
+
     def is_known(name: str) -> bool:
         nl = name.lower().strip()
         if nl in known_set_lower:
@@ -175,6 +182,9 @@ async def check_consistency(
     def is_plausible_name(word: str) -> bool:
         if len(word) < 2 or word in _EXCLUDE:
             return False
+        # 三字滑动窗口若包含“远处、时间”等常用词，也不是人物名。
+        if any(token in word for token in _EXCLUDE if len(token) >= 2):
+            return False
         # 首字必须是姓氏
         if word[0] not in _COMMON_SURNAMES:
             return False
@@ -192,8 +202,8 @@ async def check_consistency(
         if not is_plausible_name(word):
             continue
         if is_known(word):
-            seen_names.add(word)
-        elif word not in seen_names:
+            continue
+        if word not in seen_names:
             seen_names.add(word)
             alerts.append({
                 "chapter_number": chapter_number,
@@ -203,26 +213,27 @@ async def check_consistency(
             })
 
     for word in sorted(candidates_2):
-        if word in seen_names or word not in candidates_2:
+        if word in seen_names:
+            continue
+        # 已识别的完整二/三字人名不再拆成更短别名重复告警。
+        if any(word in name for name in seen_names if len(name) > len(word)):
             continue
         if not is_plausible_name(word):
             continue
         if is_known(word):
-            seen_names.add(word)
-        elif word not in seen_names:
-            seen_names.add(word)
-            alerts.append({
-                "chapter_number": chapter_number,
-                "conflict_name": word,
-                "type": "unknown_character",
-                "detail": f"检测到设定中未定义的人物名称「{word}」",
-            })
+            continue
+        seen_names.add(word)
+        alerts.append({
+            "chapter_number": chapter_number,
+            "conflict_name": word,
+            "type": "unknown_character",
+            "detail": f"检测到设定中未定义的人物名称「{word}」",
+        })
 
-    # ── 2. 跨章节追踪：检测人物"死而复生"等矛盾 ──
+    # ── 2. 跨章节追踪：检测人物长时间未出场后重新出现 ──
     for name in seen_names:
         if name in previous_characters_seen:
             prev_chapters = previous_characters_seen[name]
-            # 检查是否在相隔多章后重新出现（阈值5章，低于此视为正常叙事节奏）
             if max(prev_chapters) < chapter_number - _CHARACTER_HIATUS_THRESHOLD:
                 alerts.append({
                     "chapter_number": chapter_number,

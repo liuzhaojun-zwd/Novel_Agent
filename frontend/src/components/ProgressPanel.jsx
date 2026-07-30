@@ -1,593 +1,344 @@
-import { useState, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { useSSE } from "../hooks/useSSE";
-import { ChapterSkeleton } from "./LoadingSkeleton";
+import { EditorialReview, LocalRewritePanel } from "./EditorialTools";
+import MemoryPanel from "./MemoryPanel";
+import VersionPanel from "./VersionPanel";
+
+const STAGES = {
+  planning: "章节规划",
+  scene: "场景写作",
+  polishing: "合并润色",
+  chapter_complete: "章节收尾",
+  completed: "已完成",
+};
+
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined) return "待估算";
+  if (seconds < 60) return `${seconds} 秒`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.ceil((seconds % 3600) / 60);
+  return hours ? `${hours} 小时 ${minutes} 分` : `${minutes} 分钟`;
+}
+
+function Metric({ label, value, title }) {
+  return <div className="min-w-0 rounded-lg bg-gray-50 px-3 py-2 dark:bg-gray-900/60" title={title}>
+    <dt className="text-[11px] text-gray-400">{label}</dt>
+    <dd className="truncate text-sm font-semibold text-gray-700 dark:text-gray-200">{value}</dd>
+  </div>;
+}
 
 export default function ProgressPanel({ jobId, onBack }) {
   const [job, setJob] = useState(null);
   const [chapters, setChapters] = useState([]);
-  const [currentChapter, setCurrentChapter] = useState(0);
-  const [statusText, setStatusText] = useState("");
-  const [alerts, setAlerts] = useState([]);
-  const [readingChapter, setReadingChapter] = useState(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportMsg, setExportMsg] = useState("");
-  const [starting, setStarting] = useState(false);
-
-  // 流式实时预览
-  const [liveText, setLiveText] = useState("");
-  const [liveChapterNum, setLiveChapterNum] = useState(0);
-
-  // Issue 8: 章节质量评分
-  const [chapterQuality, setChapterQuality] = useState({});
-
-  // Issue 7: 章节编辑
-  const [editMode, setEditMode] = useState(false);
+  const [selectedNumber, setSelectedNumber] = useState(null);
   const [editContent, setEditContent] = useState("");
-  const [editChapter, setEditChapter] = useState(null);
-  const [editInstruction, setEditInstruction] = useState("");
-  const [regenerating, setRegenerating] = useState(false);
+  const [savedContent, setSavedContent] = useState("");
+  const [generationState, setGenerationState] = useState(null);
+  const [generationMode, setGenerationMode] = useState("auto");
+  const [targetMode, setTargetMode] = useState("all");
+  const [targetChapter, setTargetChapter] = useState(1);
+  const [statusText, setStatusText] = useState("");
+  const [liveText, setLiveText] = useState("");
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [assistantTab, setAssistantTab] = useState("tools");
+  const [versionResource, setVersionResource] = useState("chapter");
+  const [versionNonce, setVersionNonce] = useState(0);
+  const [rewriteInstruction, setRewriteInstruction] = useState("");
+  const [mobilePane, setMobilePane] = useState("editor");
+  const editorRef = useRef(null);
 
-  // Issue 9: 滚动位置记忆
-  const viewerRef = useRef(null);
-  const scrollPositions = useRef({});
-  const chapterContentLoaded = useRef(false);
+  const selected = useMemo(
+    () => chapters.find((item) => item.chapter_number === selectedNumber) || null,
+    [chapters, selectedNumber],
+  );
+  const dirty = Boolean(selected && editContent !== savedContent);
 
-  // Issue 12: 写作反馈
-  const [feedbackText, setFeedbackText] = useState("");
-  const [feedbackSaving, setFeedbackSaving] = useState(false);
-  const [feedbackList, setFeedbackList] = useState([]);
-  const [showFeedback, setShowFeedback] = useState(false);
-
-  // 加载任务数据
-  const loadJob = async () => {
-    try {
-      const j = await api.getJob(jobId);
-      setJob(j);
-      setCurrentChapter(j.current_chapter);
-      setAlerts(j.consistency_alerts || []);
-      updateStatusText(j.status, j.current_chapter, j.chapter_count);
-    } catch (e) { /* ignore */ }
-  };
-
-  const loadChapters = async () => {
-    try {
-      const chs = await api.getChapters(jobId);
-      setChapters(chs);
-    } catch (e) { /* ignore */ }
-  };
-
-  useEffect(() => {
-    loadJob();
-    loadChapters();
-    loadFeedback();
+  const loadJob = useCallback(async () => {
+    const result = await api.getJob(jobId);
+    setJob(result);
+    setTargetChapter((value) => Math.max(Number(value) || 1, Math.min(result.chapter_count, result.current_chapter + 1)));
+    return result;
   }, [jobId]);
 
-  const loadFeedback = async () => {
-    try {
-      const res = await api.getFeedback(jobId);
-      if (res?.feedback) setFeedbackList(res.feedback);
-    } catch (_) {}
-  };
+  const loadChapters = useCallback(async (preferredNumber = null) => {
+    const result = await api.getChapters(jobId);
+    setChapters(result);
+    const number = preferredNumber ?? selectedNumber ?? result.find((item) => item.status === "completed")?.chapter_number ?? result[0]?.chapter_number;
+    const chapter = result.find((item) => item.chapter_number === number) || result[0] || null;
+    if (chapter) {
+      setSelectedNumber(chapter.chapter_number);
+      setEditContent(chapter.content || "");
+      setSavedContent(chapter.content || "");
+    }
+    return result;
+  }, [jobId, selectedNumber]);
 
-  const updateStatusText = (st, cur, total) => {
-    const map = {
-      pending: "等待中",
-      generating_outline: "正在生成大纲...",
-      generating_chapters: cur === 0
-        ? `准备中 (共${total}章，首次生成较慢请耐心等待)`
-        : `写作中 (已完成 ${cur}/${total} 章)`,
-      paused: `已暂停 (已完成 ${cur} 章)`,
-      completed: "✅ 已完成",
-      failed: "❌ 生成失败",
+  const loadGenerationState = useCallback(async () => {
+    const result = await api.getGenerationState(jobId);
+    setGenerationState(result);
+    if (result.run?.generation_mode) setGenerationMode(result.run.generation_mode);
+    return result;
+  }, [jobId]);
+
+  const refresh = useCallback(async (preferredNumber = null) => {
+    setError("");
+    try {
+      await Promise.all([loadJob(), loadChapters(preferredNumber), loadGenerationState()]);
+    } catch (err) {
+      setError(err.message);
+    }
+  }, [loadJob, loadChapters, loadGenerationState]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => refresh(), 0);
+    return () => window.clearTimeout(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (job?.status !== "generating_chapters") return undefined;
+    const timer = window.setInterval(() => loadGenerationState().catch(() => {}), 5000);
+    return () => window.clearInterval(timer);
+  }, [job?.status, loadGenerationState]);
+
+  useEffect(() => {
+    const beforeUnload = (event) => {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
     };
-    setStatusText(map[st] || st);
-  };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, [dirty]);
 
-  // Issue 7: 进入编辑模式
-  const enterEditMode = (ch) => {
-    setEditChapter(ch);
-    setEditContent(ch.content || "");
-    setEditInstruction("");
-    setEditMode(true);
-  };
-
-  const exitEditMode = () => {
-    setEditMode(false);
-    setEditChapter(null);
-    setEditContent("");
-    setEditInstruction("");
-  };
-
-  // Issue 7: 保存编辑
-  const handleSaveEdit = async () => {
-    if (!editChapter) return;
+  const saveChapter = useCallback(async () => {
+    if (!selected || !dirty || busy) return;
+    setBusy("save");
+    setError("");
     try {
-      await api.updateChapter(jobId, editChapter.chapter_number, editContent);
-      await loadChapters();
-      // 更新当前阅读的内容
-      setReadingChapter({ ...editChapter, content: editContent });
-      exitEditMode();
-    } catch (e) {
-      alert("保存失败: " + e.message);
+      await api.updateChapter(jobId, selected.chapter_number, editContent);
+      setSavedContent(editContent);
+      setNotice("正文已保存并创建版本");
+      setVersionNonce((value) => value + 1);
+      await loadChapters(selected.chapter_number);
+    } catch (err) {
+      setError(`保存失败：${err.message}`);
+    } finally {
+      setBusy("");
+    }
+  }, [busy, dirty, editContent, jobId, loadChapters, selected]);
+
+  useEffect(() => {
+    const keydown = (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        saveChapter();
+      }
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [saveChapter]);
+
+  const chooseChapter = (chapter) => {
+    if (dirty && !window.confirm("当前正文尚未保存，确定切换章节并放弃修改吗？")) return;
+    setSelectedNumber(chapter.chapter_number);
+    setEditContent(chapter.content || "");
+    setSavedContent(chapter.content || "");
+    setError("");
+    setMobilePane("editor");
+  };
+
+  const handlePatchApplied = async (result) => {
+    setEditContent(result.content);
+    setSavedContent(result.content);
+    setVersionNonce((value) => value + 1);
+    await loadChapters(selected.chapter_number);
+  };
+
+  const regenerate = async () => {
+    if (!selected || busy) return;
+    if (dirty && !window.confirm("AI 重写会覆盖未保存修改，是否继续？")) return;
+    setBusy("rewrite");
+    setError("");
+    try {
+      const result = await api.regenerateChapter(jobId, selected.chapter_number, rewriteInstruction);
+      setEditContent(result.content || "");
+      setSavedContent(result.content || "");
+      setRewriteInstruction("");
+      setVersionNonce((value) => value + 1);
+      await loadChapters(selected.chapter_number);
+      setNotice("AI 重写完成，原正文已保留在版本历史中");
+    } catch (err) {
+      setError(`重写失败：${err.message}`);
+    } finally {
+      setBusy("");
     }
   };
 
-  // Issue 7: 重新生成
-  const handleRegenerate = async () => {
-    if (!editChapter) return;
-    setRegenerating(true);
+  const startGeneration = async (resume = false) => {
+    if (!job || busy) return;
+    const number = Math.max(1, Math.min(job.chapter_count, Number(targetChapter) || 1));
+    const options = { mode: generationMode };
+    let upTo;
+    if (targetMode === "single") options.chapter = number;
+    if (targetMode === "up_to") upTo = number;
+    setBusy("generation");
+    setError("");
     try {
-      await api.regenerateChapter(jobId, editChapter.chapter_number, editInstruction);
-      setTimeout(async () => {
-        await loadChapters();
-        const chs = await api.getChapters(jobId);
-        const updated = chs.find(c => c.chapter_number === editChapter.chapter_number);
-        if (updated) {
-          setReadingChapter(updated);
-          setEditContent(updated.content || "");
-        }
-        setRegenerating(false);
-      }, 1000);
-    } catch (e) {
-      alert("重新生成失败: " + e.message);
-      setRegenerating(false);
+      if (resume) await api.resumeGeneration(jobId, upTo, options);
+      else await api.startGeneration(jobId, upTo, options);
+      await refresh();
+    } catch (err) {
+      setError(`${resume ? "恢复" : "启动"}失败：${err.message}`);
+    } finally {
+      setBusy("");
     }
   };
 
-  // SSE 实时推送
+  const controlGeneration = async (action) => {
+    if (busy) return;
+    setBusy(action);
+    setError("");
+    try {
+      const result = action === "pause" ? await api.pauseGeneration(jobId) : await api.cancelGeneration(jobId);
+      setStatusText(result.message);
+      await refresh();
+    } catch (err) {
+      setError(`${action === "pause" ? "暂停" : "取消"}失败：${err.message}`);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const exportBook = (format) => {
+    const link = document.createElement("a");
+    link.href = api.getExportUrl(jobId, format);
+    link.click();
+    setNotice(`已开始导出 ${format.toUpperCase()}`);
+  };
+
   useSSE(jobId, (event, data) => {
     if (event === "initial_state") {
-      // Issue 4: 重连后补课，使用初始状态快照更新组件
-      if (data.status) {
-        updateStatusText(data.status, data.current_chapter || 0, data.chapter_count || 0);
-        setCurrentChapter(data.current_chapter || 0);
-        setAlerts(data.alerts || []);
-        // 恢复章节列表中的状态信息
-        if (data.chapters && data.chapters.length > 0) {
-          setChapters(prev => prev.map(existing => {
-            const match = data.chapters.find(c => c.chapter_number === existing.chapter_number);
-            if (match) {
-              return { ...existing, word_count: match.word_count, status: match.status };
-            }
-            return existing;
-          }));
-          // 如果章节列表为空（还未加载），直接用初始状态的数据
-          if (data.chapters.length > 0) {
-            setChapters(data.chapters);
-          }
-        }
-      }
+      setStatusText(data.status || "");
       return;
     }
-
-    if (event === "progress") {
-      setCurrentChapter(data.chapter);
-      setStatusText(
-        data.chapter === 0
-          ? `准备中 (共${data.total}章，正在调用AI生成...)`
-          : `写作中 (已完成 ${data.chapter}/${data.total} 章)`
-      );
-      loadChapters();
-    } else if (event === "token") {
-      setLiveChapterNum(data.chapter);
-      setLiveText(data.accumulated);
-    } else if (event === "chapter_complete") {
+    if (["progress", "scene_progress", "control_state"].includes(event)) {
+      setStatusText(data.message || data.state || "生成中");
+      loadGenerationState().catch(() => {});
+    }
+    if (event === "token") setLiveText(data.accumulated || "");
+    if (["chapter_complete", "batch_complete", "job_complete"].includes(event)) {
       setLiveText("");
-      setLiveChapterNum(0);
-      // 存储质量评分
-      if (data.quality_score !== undefined) {
-        setChapterQuality(prev => ({
-          ...prev,
-          [data.chapter]: { score: data.quality_score, summary: data.quality_summary },
-        }));
-      }
-      loadChapters();
-      loadJob();
-    } else if (event === "quality_issue") {
-      // 展示质量提示（短暂显示）
-      const msg = `第${data.chapter}章：${data.issues?.join("；") || ""}`;
-      setExportMsg("📝 " + msg);
-      setTimeout(() => setExportMsg(""), 8000);
-    } else if (event === "batch_complete") {
-      setLiveText("");
-      setLiveChapterNum(0);
-      setCurrentChapter(data.chapter);
-      setStatusText(`已暂停 (已完成 ${data.chapter} 章)`);
-      loadChapters();
-      loadJob();
-    } else if (event === "job_complete") {
-      setLiveText("");
-      setLiveChapterNum(0);
-      loadJob();
-      loadChapters();
-    } else if (event === "error") {
-      loadJob();
+      refresh(selectedNumber);
+      setVersionNonce((value) => value + 1);
+    }
+    if (event === "error") {
+      setError(data.error || "生成失败，可从 checkpoint 恢复");
+      refresh(selectedNumber);
     }
   });
 
-  // Issue 9: 滚动位置记忆
-  useEffect(() => {
-    if (readingChapter && viewerRef.current) {
-      const saved = scrollPositions.current[readingChapter.chapter_number];
-      if (saved !== undefined && !chapterContentLoaded.current) {
-        viewerRef.current.scrollTop = saved;
-      }
-      chapterContentLoaded.current = true;
-    }
-  }, [readingChapter]);
-
-  // Issue 12: 提交反馈
-  const handleSaveFeedback = async () => {
-    if (!feedbackText.trim()) return;
-    setFeedbackSaving(true);
-    const newFeedback = {
-      chapter: readingChapter?.chapter_number || 0,
-      text: feedbackText.trim(),
-      timestamp: new Date().toISOString(),
-    };
-    try {
-      const updatedList = [...feedbackList, newFeedback];
-      await api.saveFeedback(jobId, updatedList);
-      setFeedbackList(updatedList);
-      setFeedbackText("");
-      setExportMsg("✅ 反馈已保存，将在后续章节生成中参考");
-      setTimeout(() => setExportMsg(""), 4000);
-    } catch (e) {
-      setExportMsg("反馈保存失败: " + e.message);
-    } finally {
-      setFeedbackSaving(false);
-    }
+  const handleRestored = async () => {
+    await refresh(selectedNumber);
+    setVersionNonce((value) => value + 1);
+    setNotice("版本已恢复，恢复前内容已自动备份");
   };
 
-  const handleStart = async (upTo) => {
-    if (starting) return;
-    setStarting(true);
-    setStatusText("");
-    try {
-      await api.startGeneration(jobId, upTo);
-      await loadJob();
-      await loadChapters();
-    } catch (e) {
-      setStatusText("启动失败: " + e.message);
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  const handleResume = async (upTo) => {
-    if (starting) return;
-    setStarting(true);
-    setStatusText("");
-    try {
-      await api.resumeGeneration(jobId, upTo);
-      await loadJob();
-      await loadChapters();
-    } catch (e) {
-      setStatusText("续生失败: " + e.message);
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  const handleExport = async (fmt) => {
-    setExporting(true);
-    setExportMsg("");
-    try {
-      const url = api.getExportUrl(jobId, fmt);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setExportMsg(`✅ 已开始下载 .${fmt} 文件`);
-    } catch (e) {
-      setExportMsg("导出失败: " + e.message);
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  const totalChapters = job?.chapter_count || 0;
-  const completedChapters = chapters.filter((c) => c.status === "completed").length;
-  const progressPct = totalChapters > 0 ? Math.round((completedChapters / totalChapters) * 100) : 0;
+  const metrics = generationState?.metrics || {};
+  const completed = chapters.filter((item) => item.status === "completed").length;
+  const total = job?.chapter_count || 0;
+  const progress = total ? Math.round((completed / total) * 100) : 0;
   const isGenerating = job?.status === "generating_chapters";
+  const canStart = job?.status === "pending" && job?.outline;
+  const canResume = ["paused", "failed"].includes(job?.status);
+  const versionKey = versionResource === "chapter" ? String(selectedNumber || "") : "";
 
-  // 评分颜色
-  const qualityColor = (score) => {
-    if (score >= 90) return "text-green-600";
-    if (score >= 75) return "text-blue-600";
-    if (score >= 60) return "text-yellow-600";
-    return "text-red-500";
-  };
+  if (!job) return <div role="status" className="grid min-h-[60vh] place-items-center text-gray-400">正在加载创作工作台…</div>;
 
-  if (!job) return <div className="text-center py-12 text-gray-400">加载中...</div>;
-
-  return (
-    <div className="max-w-4xl mx-auto py-8 px-4">
-      <button onClick={onBack} className="text-sm text-indigo-600 hover:text-indigo-800 mb-4 cursor-pointer">
-        ← 返回任务列表
-      </button>
-
-      {/* 顶部状态卡 */}
-      <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100 mb-6">
-        <div className="flex items-start justify-between">
-          <div>
-            <h2 className="text-xl font-bold text-gray-900">{job.theme}</h2>
-            <p className="text-gray-500 mt-1">{job.topic}</p>
-          </div>
-          <div className="text-right">
-            <span className={`inline-block px-3 py-1 rounded-full text-sm font-medium ${
-              job.status === "completed" ? "bg-green-100 text-green-700" :
-              job.status === "failed" ? "bg-red-100 text-red-700" :
-              job.status === "paused" ? "bg-yellow-100 text-yellow-700" :
-              job.status === "generating_chapters" ? "bg-blue-100 text-blue-700" :
-              "bg-gray-100 text-gray-600"
-            }`}>
-              {statusText}
-            </span>
-          </div>
+  return <main className="mx-auto w-full max-w-[1600px] px-3 py-4 sm:px-5" aria-label="小说创作工作台">
+    <div aria-live="polite" className="sr-only">{notice}</div>
+    <header className="mb-4 rounded-2xl border border-gray-100 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <button type="button" onClick={onBack} aria-label="返回任务列表" className="mt-0.5 rounded-lg p-2 text-gray-400 hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-indigo-500 dark:hover:bg-gray-700">←</button>
+          <div><h1 className="text-lg font-bold text-gray-900 dark:text-white">{job.theme}</h1><p className="max-w-2xl text-sm text-gray-500 dark:text-gray-400">{job.topic}</p></div>
         </div>
-
-        {/* 进度条 */}
-        <div className="mt-4">
-          <div className="flex justify-between text-sm text-gray-500 mb-1">
-            <span>{completedChapters}/{totalChapters} 章</span>
-            <span>{progressPct}%</span>
-          </div>
-          <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
-            <div
-              className="bg-indigo-600 h-full rounded-full transition-all duration-500"
-              style={{ width: `${progressPct}%` }}
-            />
-          </div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => exportBook("md")} disabled={!completed} className="rounded-lg border border-gray-200 px-3 py-2 text-xs disabled:opacity-40 dark:border-gray-600">导出 MD</button>
+          <button type="button" onClick={() => exportBook("txt")} disabled={!completed} className="rounded-lg border border-gray-200 px-3 py-2 text-xs disabled:opacity-40 dark:border-gray-600">导出 TXT</button>
         </div>
       </div>
+      <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-700" aria-label={`全书进度 ${progress}%`} role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"><div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${progress}%` }} /></div>
+      <dl className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+        <Metric label="全书进度" value={`${completed}/${total} 章 · ${progress}%`} />
+        <Metric label="生成阶段" value={STAGES[generationState?.run?.stage] || statusText || job.status} />
+        <Metric label="预计剩余" value={formatDuration(metrics.eta_seconds)} />
+        <Metric label="运行耗时" value={formatDuration(metrics.elapsed_seconds || 0)} />
+        <Metric label="Token（估算）" value={(metrics.total_tokens || 0).toLocaleString()} title={metrics.pricing_note} />
+        <Metric label="费用（估算）" value={`$${(metrics.cost_usd || 0).toFixed(4)}`} title={metrics.pricing_note} />
+      </dl>
+    </header>
 
-      {/* 操作按钮 */}
-      <div className="flex flex-wrap gap-2 mb-6">
-        {job.status === "pending" && job.outline && (
-          <div className="flex flex-wrap items-center gap-2">
-            <button onClick={() => handleStart(totalChapters < 5 ? totalChapters : 5)} disabled={starting} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳ 启动中..." : "▶️ 写5章"}
-            </button>
-            <button onClick={() => handleStart(totalChapters < 10 ? totalChapters : 10)} disabled={starting} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳ 启动中..." : "▶️ 写10章"}
-            </button>
-            <button onClick={() => handleStart()} disabled={starting} className="px-4 py-2 bg-indigo-700 hover:bg-indigo-800 disabled:bg-indigo-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳ 启动中..." : `▶️ 全部(${totalChapters}章)`}
-            </button>
-          </div>
-        )}
-        {job.status === "paused" && (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-gray-500 mr-1">续写:</span>
-            <button onClick={() => handleResume(completedChapters + 5 > totalChapters ? totalChapters : completedChapters + 5)} disabled={starting} className="px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳" : "5章"}
-            </button>
-            <button onClick={() => handleResume(completedChapters + 10 > totalChapters ? totalChapters : completedChapters + 10)} disabled={starting} className="px-4 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳" : "10章"}
-            </button>
-            <button onClick={() => handleResume()} disabled={starting} className="px-4 py-2 bg-amber-700 hover:bg-amber-800 disabled:bg-amber-400 text-white rounded-lg text-sm font-medium transition cursor-pointer disabled:cursor-not-allowed">
-              {starting ? "⏳" : `全部(剩余${totalChapters - completedChapters}章)`}
-            </button>
-          </div>
-        )}
-        <button onClick={() => handleExport("md")} disabled={exporting || completedChapters === 0} className="px-4 py-2 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 transition cursor-pointer">📥 导出 MD</button>
-        <button onClick={() => handleExport("txt")} disabled={exporting || completedChapters === 0} className="px-4 py-2 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 transition cursor-pointer">📥 导出 TXT</button>
-      </div>
-      {exportMsg && <p className="text-sm text-gray-600 mb-4">{exportMsg}</p>}
+    {(canStart || canResume || isGenerating) && <section aria-label="生成控制" className="mb-4 flex flex-wrap items-end gap-2 rounded-xl border border-gray-100 bg-white p-3 dark:border-gray-700 dark:bg-gray-800">
+      {!isGenerating && <>
+        <label className="text-xs text-gray-500">模式<select value={generationMode} onChange={(event) => setGenerationMode(event.target.value)} className="mt-1 block rounded-lg border border-gray-200 bg-white px-2 py-2 text-sm dark:border-gray-600 dark:bg-gray-900"><option value="auto">全自动</option><option value="collaborative">逐章协作</option></select></label>
+        <label className="text-xs text-gray-500">范围<select value={targetMode} onChange={(event) => setTargetMode(event.target.value)} className="mt-1 block rounded-lg border border-gray-200 bg-white px-2 py-2 text-sm dark:border-gray-600 dark:bg-gray-900"><option value="all">剩余全部</option><option value="up_to">生成到第 N 章</option><option value="single">仅单章</option></select></label>
+        {targetMode !== "all" && <label className="text-xs text-gray-500">章节<input type="number" min="1" max={total} value={targetChapter} onChange={(event) => setTargetChapter(event.target.value)} className="mt-1 block w-20 rounded-lg border border-gray-200 bg-white px-2 py-2 text-sm dark:border-gray-600 dark:bg-gray-900" /></label>}
+        <button type="button" onClick={() => startGeneration(canResume)} disabled={busy === "generation"} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50">{busy === "generation" ? "启动中…" : canResume ? "恢复生成" : "开始生成"}</button>
+      </>}
+      {isGenerating && <><button type="button" onClick={() => controlGeneration("pause")} disabled={Boolean(busy)} className="rounded-lg bg-amber-500 px-4 py-2 text-sm text-white disabled:opacity-50">暂停</button><button type="button" onClick={() => controlGeneration("cancel")} disabled={Boolean(busy)} className="rounded-lg bg-red-500 px-4 py-2 text-sm text-white disabled:opacity-50">取消</button><span className="self-center text-xs text-blue-600 dark:text-blue-300">{statusText || "场景级生成进行中"}</span></>}
+    </section>}
 
-      {/* 流式实时预览 */}
-      {isGenerating && liveText && (
-        <div className="bg-white rounded-xl p-6 shadow-sm border border-blue-100 mb-6">
-          <h3 className="text-sm font-semibold text-blue-600 mb-3">
-            ✍️ 实时写作 — 第 {liveChapterNum} 章
-            <span className="ml-2 text-blue-400 font-normal text-xs animate-pulse">写作中...</span>
-          </h3>
-          <div className="prose text-gray-700 leading-relaxed whitespace-pre-wrap max-h-96 overflow-y-auto text-sm bg-gray-50 rounded-lg p-4">
-            {liveText}
-            <span className="inline-block w-0.5 h-4 bg-blue-500 ml-0.5 animate-pulse" />
-          </div>
-          <p className="text-xs text-gray-400 mt-2">
-            约 {liveText.replace(/[\s\n]/g, "").length} 字 · 实时生成中
-          </p>
+    {error && <div role="alert" className="mb-4 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"><span>{error}</span><button type="button" aria-label="关闭错误提示" onClick={() => setError("")}>✕</button></div>}
+    {notice && <div role="status" className="mb-4 rounded-xl border border-green-200 bg-green-50 p-3 text-sm text-green-700 dark:border-green-900 dark:bg-green-950/30 dark:text-green-300">{notice}</div>}
+
+    <nav className="mb-3 grid grid-cols-3 rounded-xl bg-gray-100 p-1 lg:hidden dark:bg-gray-800" aria-label="移动端工作台面板">
+      {[["tree", "章节"], ["editor", "正文"], ["assistant", "助手"]].map(([value, label]) => <button key={value} type="button" onClick={() => setMobilePane(value)} aria-current={mobilePane === value ? "page" : undefined} className={`rounded-lg px-3 py-2 text-sm ${mobilePane === value ? "bg-white font-medium text-indigo-600 shadow-sm dark:bg-gray-700 dark:text-indigo-300" : "text-gray-500"}`}>{label}</button>)}
+    </nav>
+
+    <div className="grid min-h-[68vh] grid-cols-1 gap-3 lg:grid-cols-[260px_minmax(420px,1fr)_340px]">
+      <aside className={`${mobilePane === "tree" ? "block" : "hidden"} min-h-0 rounded-2xl border border-gray-100 bg-white p-3 lg:block dark:border-gray-700 dark:bg-gray-800`} aria-label="章节树">
+        <div className="mb-3 flex items-center justify-between"><h2 className="text-sm font-semibold text-gray-800 dark:text-gray-100">章节树</h2><span className="text-xs text-gray-400">{completed}/{total}</span></div>
+        {chapters.length === 0 ? <div className="rounded-xl border border-dashed border-gray-200 p-6 text-center text-sm text-gray-400 dark:border-gray-700"><div className="mb-2 text-2xl">🌱</div>大纲确认后，章节会显示在这里</div> : <ol className="max-h-[62vh] space-y-1 overflow-y-auto pr-1">
+          {chapters.map((chapter) => <li key={chapter.chapter_number}><button type="button" onClick={() => chooseChapter(chapter)} aria-current={selectedNumber === chapter.chapter_number ? "true" : undefined} className={`w-full rounded-lg px-3 py-2.5 text-left transition focus-visible:outline-2 focus-visible:outline-indigo-500 ${selectedNumber === chapter.chapter_number ? "bg-indigo-50 text-indigo-800 dark:bg-indigo-950/50 dark:text-indigo-200" : "hover:bg-gray-50 dark:hover:bg-gray-700"}`}><span className="flex items-center justify-between gap-2"><span className="truncate text-sm font-medium">{chapter.chapter_number}. {chapter.title}</span><span aria-label={chapter.status === "completed" ? "已完成" : "待生成"} className={chapter.status === "completed" ? "text-green-500" : "text-gray-300"}>{chapter.status === "completed" ? "●" : "○"}</span></span><span className="mt-0.5 block text-[11px] text-gray-400">{chapter.word_count?.toLocaleString() || 0} 字</span></button></li>)}
+        </ol>}
+      </aside>
+
+      <section className={`${mobilePane === "editor" ? "flex" : "hidden"} min-h-0 flex-col rounded-2xl border border-gray-100 bg-white lg:flex dark:border-gray-700 dark:bg-gray-800`} aria-label="正文编辑器">
+        {selected ? <>
+          <header className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 px-4 py-3 dark:border-gray-700">
+            <div className="min-w-0"><h2 className="truncate font-semibold text-gray-900 dark:text-white">第 {selected.chapter_number} 章 · {selected.title}</h2><p className="text-xs text-gray-400">{editContent.replace(/\s/g, "").length.toLocaleString()} 字 · {dirty ? "有未保存修改" : "已保存"}</p></div>
+            <div className="flex items-center gap-2"><button type="button" onClick={() => { setEditContent(savedContent); setError(""); }} disabled={!dirty || Boolean(busy)} className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-gray-600">放弃修改</button><button type="button" onClick={saveChapter} disabled={!dirty || Boolean(busy)} className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">{busy === "save" ? "保存中…" : "保存 Ctrl+S"}</button></div>
+          </header>
+          {isGenerating && liveText && selected.chapter_number === (generationState?.run?.current_chapter || selected.chapter_number) ? <div className="border-b border-blue-100 bg-blue-50 p-3 text-xs text-blue-700 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-300">实时生成预览已更新，章节完成后会载入编辑器。</div> : null}
+          <textarea ref={editorRef} value={editContent} onChange={(event) => setEditContent(event.target.value)} disabled={selected.status !== "completed" && !editContent} aria-label={`第${selected.chapter_number}章正文`} placeholder={selected.status === "completed" ? "在这里开始编辑正文…" : "本章尚未生成"} className="min-h-[58vh] flex-1 resize-none bg-transparent p-5 font-serif text-[15px] leading-8 text-gray-800 outline-none placeholder:text-gray-300 disabled:cursor-not-allowed dark:text-gray-100" />
+        </> : <div className="grid flex-1 place-items-center p-8 text-center text-gray-400"><div><div className="mb-3 text-4xl">📖</div><p>从章节树选择一章开始创作</p><p className="mt-1 text-xs">正文、保存状态和版本会集中显示在这里</p></div></div>}
+      </section>
+
+      <aside className={`${mobilePane === "assistant" ? "block" : "hidden"} min-h-0 rounded-2xl border border-gray-100 bg-white lg:block dark:border-gray-700 dark:bg-gray-800`} aria-label="创作助手">
+        <div className="grid grid-cols-2 border-b border-gray-100 p-1 dark:border-gray-700" role="tablist" aria-label="创作助手功能">
+          <button type="button" role="tab" aria-selected={assistantTab === "tools"} onClick={() => setAssistantTab("tools")} className={`rounded-lg px-3 py-2 text-sm ${assistantTab === "tools" ? "bg-indigo-50 font-medium text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-200" : "text-gray-500"}`}>AI 助手</button>
+          <button type="button" role="tab" aria-selected={assistantTab === "versions"} onClick={() => setAssistantTab("versions")} className={`rounded-lg px-3 py-2 text-sm ${assistantTab === "versions" ? "bg-indigo-50 font-medium text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-200" : "text-gray-500"}`}>版本历史</button>
         </div>
-      )}
-
-      {/* Issue 7: 编辑弹窗 */}
-      {editMode && editChapter && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold">编辑 第{editChapter.chapter_number}章 {editChapter.title}</h3>
-              <button onClick={exitEditMode} className="text-gray-400 hover:text-gray-700 cursor-pointer text-xl">✕</button>
+        <div className="max-h-[65vh] overflow-y-auto p-4">
+          {assistantTab === "tools" && (selected?.status === "completed" ? <div className="space-y-5">
+            <section><h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">整章重写</h3><p className="mb-2 text-xs text-gray-400">原正文会自动保留为历史版本</p><textarea value={rewriteInstruction} onChange={(event) => setRewriteInstruction(event.target.value)} placeholder="例如：加快节奏，强化人物冲突" className="h-20 w-full resize-none rounded-lg border border-gray-200 bg-transparent p-2 text-sm dark:border-gray-600" /><button type="button" onClick={regenerate} disabled={Boolean(busy)} className="mt-2 w-full rounded-lg bg-purple-600 px-3 py-2 text-sm text-white disabled:opacity-50">{busy === "rewrite" ? "重写中…" : "AI 重写本章"}</button></section>
+            <LocalRewritePanel jobId={jobId} chapterNumber={selected.chapter_number} content={editContent} textareaRef={editorRef} onApplied={handlePatchApplied} />
+            <EditorialReview key={`review-${selected.chapter_number}-${versionNonce}`} jobId={jobId} chapterNumber={selected.chapter_number} />
+          </div> : <div className="rounded-xl border border-dashed border-gray-200 p-6 text-center text-sm text-gray-400 dark:border-gray-700">选择已完成章节后，可使用局部修复、整章重写和语义审稿</div>)}
+          {assistantTab === "versions" && <div>
+            <div className="mb-4 grid grid-cols-3 rounded-lg bg-gray-100 p-1 dark:bg-gray-900" aria-label="版本资源类型">
+              {[["chapter", "正文"], ["outline", "大纲"], ["settings", "设定"]].map(([value, label]) => <button key={value} type="button" onClick={() => setVersionResource(value)} disabled={value === "chapter" && !selectedNumber} className={`rounded-md px-2 py-1.5 text-xs disabled:opacity-40 ${versionResource === value ? "bg-white font-medium text-indigo-600 shadow-sm dark:bg-gray-700 dark:text-indigo-300" : "text-gray-500"}`}>{label}</button>)}
             </div>
-
-            {/* 正文编辑区 */}
-            <label className="text-sm font-medium text-gray-600 mb-1 block">正文内容</label>
-            <textarea
-              value={editContent}
-              onChange={(e) => setEditContent(e.target.value)}
-              className="w-full h-64 border border-gray-200 rounded-lg p-3 text-sm font-mono leading-relaxed resize-y"
-            />
-
-            {/* 修改指令 + 重新生成 */}
-            <div className="mt-4 pt-4 border-t border-gray-100">
-              <label className="text-sm font-medium text-gray-600 mb-1 block">💡 或输入修改指令让 AI 重写</label>
-              <div className="flex gap-2">
-                <input
-                  value={editInstruction}
-                  onChange={(e) => setEditInstruction(e.target.value)}
-                  placeholder="如：把对话写得更生动、加入更多细节描写"
-                  className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm"
-                />
-                <button
-                  onClick={handleRegenerate}
-                  disabled={regenerating}
-                  className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-purple-400 text-white rounded-lg text-sm transition cursor-pointer disabled:cursor-not-allowed whitespace-nowrap"
-                >
-                  {regenerating ? "⏳ 生成中..." : "🤖 AI 重写"}
-                </button>
-              </div>
-            </div>
-
-            {/* 操作按钮 */}
-            <div className="flex justify-end gap-2 mt-4">
-              <button onClick={exitEditMode} className="px-4 py-2 border border-gray-200 rounded-lg text-sm hover:bg-gray-50 cursor-pointer">取消</button>
-              <button onClick={handleSaveEdit} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm transition cursor-pointer">💾 保存</button>
-            </div>
-          </div>
+            <VersionPanel key={`${versionResource}-${versionKey}-${versionNonce}`} jobId={jobId} resourceType={versionResource} resourceKey={versionKey} onRestored={handleRestored} />
+          </div>}
         </div>
-      )}
-
-      {/* 章节列表 + 正文 */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-1">
-          <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
-            章节列表
-          </h3>
-          <div className="space-y-2">
-            {chapters.map((ch) => {
-              const quality = chapterQuality[ch.chapter_number];
-              return (
-                <button
-                  key={ch.chapter_number}
-                  onClick={() => {
-                    // Issue 9: 保存当前滚动位置
-                    if (readingChapter && viewerRef.current) {
-                      scrollPositions.current[readingChapter.chapter_number] = viewerRef.current.scrollTop;
-                    }
-                    chapterContentLoaded.current = false;
-                    setReadingChapter(ch);
-                    exitEditMode();
-                  }}
-                  className={`w-full text-left p-3 rounded-lg border transition cursor-pointer ${
-                    ch.status === "completed"
-                      ? "border-green-200 bg-green-50 hover:bg-green-100"
-                      : "border-gray-100 bg-white hover:bg-gray-50"
-                  } ${readingChapter?.chapter_number === ch.chapter_number ? "ring-2 ring-indigo-500" : ""}`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium text-sm text-gray-900 truncate">
-                      #{ch.chapter_number} {ch.title}
-                    </span>
-                    {ch.status === "completed" && <span className="text-green-500 text-xs">✓</span>}
-                  </div>
-                  <div className="flex items-center gap-2 mt-0.5">
-                    {ch.word_count > 0 && (
-                      <span className="text-xs text-gray-400">{ch.word_count} 字</span>
-                    )}
-                    {/* Issue 8: 质量评分 */}
-                    {quality && (
-                      <span className={`text-xs font-medium ${qualityColor(quality.score)}`}>
-                        {quality.summary}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* 正文阅读 + Issue 7: 编辑按钮 */}
-        <div className="lg:col-span-2">
-          {readingChapter ? (
-            <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100">
-              <div className="flex items-start justify-between mb-1">
-                <div>
-                  <h3 className="text-lg font-bold text-gray-900">
-                    第{readingChapter.chapter_number}章 {readingChapter.title}
-                  </h3>
-                  <p className="text-sm text-gray-400">{readingChapter.word_count} 字</p>
-                </div>
-                {readingChapter.status === "completed" && (
-                  <button
-                    onClick={() => enterEditMode(readingChapter)}
-                    className="text-xs px-3 py-1.5 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-500 transition cursor-pointer whitespace-nowrap"
-                  >
-                    ✏️ 编辑/重写
-                  </button>
-                )}
-              </div>
-              <div className="prose text-gray-700 leading-relaxed whitespace-pre-wrap" ref={viewerRef}>
-                {readingChapter.content || (
-                  <span className="text-gray-300 italic">正文生成中...</span>
-                )}
-              </div>
-
-              {/* Issue 12: 写作反馈 */}
-              {readingChapter.status === "completed" && (
-                <div className="mt-6 pt-4 border-t border-gray-100">
-                  <button
-                    onClick={() => setShowFeedback(!showFeedback)}
-                    className="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 cursor-pointer transition"
-                  >
-                    {showFeedback ? "▼" : "▶"} 写作反馈 ({feedbackList.length})
-                  </button>
-                  {showFeedback && (
-                    <div className="mt-3 space-y-3">
-                      {/* 已有反馈列表 */}
-                      {feedbackList.length > 0 && (
-                        <div className="space-y-1.5 max-h-32 overflow-y-auto">
-                          {feedbackList.map((fb, i) => (
-                            <div key={i} className="text-xs text-gray-500 bg-gray-50 rounded-lg px-3 py-2">
-                              <span className="text-gray-400">第{fb.chapter}章 · </span>
-                              {fb.text}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {/* 新反馈输入 */}
-                      <div className="flex gap-2">
-                        <input
-                          value={feedbackText}
-                          onChange={(e) => setFeedbackText(e.target.value)}
-                          placeholder="如：节奏再快一点、多一些对话、加入更多细节描写"
-                          className="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
-                          onKeyDown={(e) => { if (e.key === "Enter") handleSaveFeedback(); }}
-                        />
-                        <button
-                          onClick={handleSaveFeedback}
-                          disabled={feedbackSaving || !feedbackText.trim()}
-                          className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm rounded-lg transition cursor-pointer disabled:cursor-not-allowed"
-                        >
-                          发送
-                        </button>
-                      </div>
-                      <p className="text-xs text-gray-400">反馈将在后续章节生成时自动参考</p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="bg-gray-50 rounded-xl p-12 text-center text-gray-400 border border-dashed border-gray-200">
-              <div className="text-4xl mb-2">📖</div>
-              <p>点击左侧章节查看正文</p>
-              {isGenerating && !liveText && (
-                <p className="text-xs mt-2 text-blue-400">AI 正在准备中...</p>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 一致性告警 */}
-      {alerts.length > 0 && (
-        <div className="mt-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-          <h4 className="text-sm font-semibold text-yellow-800 mb-2">⚠️ 一致性告警</h4>
-          <div className="space-y-1 max-h-40 overflow-y-auto">
-            {alerts.map((a, i) => (
-              <p key={i} className="text-sm text-yellow-700">
-                第 {a.chapter_number} 章 — {a.detail || `检测到未定义人物「${a.conflict_name}」`}
-              </p>
-            ))}
-          </div>
-        </div>
-      )}
+      </aside>
     </div>
-  );
+
+    {liveText && isGenerating && <section className="mt-4 rounded-xl border border-blue-100 bg-blue-50 p-4 dark:border-blue-900 dark:bg-blue-950/30" aria-live="polite"><h2 className="mb-2 text-sm font-semibold text-blue-700 dark:text-blue-300">实时写作预览</h2><div className="max-h-48 overflow-y-auto whitespace-pre-wrap text-sm leading-7 text-gray-700 dark:text-gray-200">{liveText}</div></section>}
+    <MemoryPanel jobId={jobId} />
+  </main>;
 }

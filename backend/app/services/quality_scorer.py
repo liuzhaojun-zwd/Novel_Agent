@@ -11,6 +11,8 @@
 import re
 from typing import Optional
 
+SCORER_VERSION = "2.0.0"
+
 
 # ── 中文引号配对检测 ──
 _DIALOGUE_OPENERS = {'"', '"', '「', '\u201c'}
@@ -32,6 +34,7 @@ def score_chapter(
     """
     if not content:
         return {
+            "scorer_version": SCORER_VERSION,
             "overall": 0,
             "dimensions": {},
             "issues": ["章节内容为空"],
@@ -161,8 +164,13 @@ def score_chapter(
                                       "推", "拉", "抓", "握", "逃", "追")):
         open_score += 15
     
-    # 对话开头减分
-    if any(c in opening[:20] for c in _DIALOGUE_OPENERS):
+    # 引号或“某人说道：”形式的对话开头减分
+    starts_with_quoted_dialogue = any(c in opening[:20] for c in _DIALOGUE_OPENERS)
+    starts_with_speech = bool(re.match(
+        r'^.{0,12}(?:说道|说|问道|问|喊道|喊|答道|回答)[：:]',
+        opening,
+    ))
+    if starts_with_quoted_dialogue or starts_with_speech:
         open_score -= 10
         issues.append("章节以对话开头，建议加入场景描写")
 
@@ -229,6 +237,7 @@ def score_chapter(
     overall = round(max(0, min(100, overall)))
 
     return {
+        "scorer_version": SCORER_VERSION,
         "overall": overall,
         "dimensions": dimensions,
         "char_count": char_count,

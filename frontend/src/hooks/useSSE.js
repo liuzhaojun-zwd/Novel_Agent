@@ -1,119 +1,67 @@
 import { useEffect, useRef, useCallback } from "react";
 import { api } from "../api";
 
+const STREAM_EVENTS = [
+  "initial_state", "progress", "token",
+  "scene_plan", "scene_progress", "scene_complete", "control_state",
+  "chapter_complete", "batch_complete", "job_complete", "quality_issue",
+  "memory_updated", "memory_warning",
+  "outline_progress", "outline_token", "outline_done", "outline_error",
+];
+
 export function useSSE(jobId, onEvent) {
   const eventSourceRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const connectRef = useRef(null);
   const onEventRef = useRef(onEvent);
-  onEventRef.current = onEvent;
+
+  useEffect(() => {
+    onEventRef.current = onEvent;
+  }, [onEvent]);
 
   const connect = useCallback(() => {
     if (!jobId) return;
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
     }
+    eventSourceRef.current?.close();
 
-    const es = new EventSource(api.streamUrl(jobId));
-    eventSourceRef.current = es;
+    const eventSource = new EventSource(api.streamUrl(jobId));
+    eventSourceRef.current = eventSource;
 
-    // Issue 4: 初始状态快照（重连后补课）
-    es.addEventListener("initial_state", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("initial_state", data);
-      } catch (_) {}
+    STREAM_EVENTS.forEach((eventName) => {
+      eventSource.addEventListener(eventName, (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          onEventRef.current?.(eventName, data);
+          if (eventName === "job_complete") eventSource.close();
+        } catch {
+          // 忽略无法解析的单个事件，不中断后续流。
+        }
+      });
     });
 
-    es.addEventListener("progress", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("progress", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("token", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("token", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("chapter_complete", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("chapter_complete", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("batch_complete", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("batch_complete", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("job_complete", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("job_complete", data);
-      } catch (_) {}
-      es.close();
-    });
-
-    es.addEventListener("quality_issue", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("quality_issue", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("error", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("error", data);
-      } catch (_) {}
-    });
-
-    // 大纲流式事件
-    es.addEventListener("outline_progress", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("outline_progress", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("outline_token", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("outline_token", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("outline_done", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("outline_done", data);
-      } catch (_) {}
-    });
-
-    es.addEventListener("outline_error", (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        onEventRef.current?.("outline_error", data);
-      } catch (_) {}
-    });
-
-    es.onerror = () => {
-      es.close();
-      setTimeout(connect, 3000);
+    eventSource.onerror = () => {
+      eventSource.close();
+      reconnectTimerRef.current = window.setTimeout(
+        () => connectRef.current?.(),
+        3000,
+      );
     };
   }, [jobId]);
 
   useEffect(() => {
+    connectRef.current = connect;
     connect();
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      connectRef.current = null;
     };
   }, [connect]);
 

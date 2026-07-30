@@ -3,7 +3,7 @@ import SetupForm from "./components/SetupForm";
 import OutlineView from "./components/OutlineView";
 import ProgressPanel from "./components/ProgressPanel";
 import SettingsModal from "./components/SettingsModal";
-import { CardSkeleton } from "./components/LoadingSkeleton";
+import AuthPanel from "./components/AuthPanel";
 import { api } from "./api";
 
 export default function App() {
@@ -14,6 +14,17 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [llmReady, setLlmReady] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [authInitialized, setAuthInitialized] = useState(false);
+  const [user, setUser] = useState(null);
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const list = await api.listJobs();
+      setJobs(list);
+    } catch {
+      // 首页仍可用于创建任务，后续操作会显示具体错误。
+    }
+  }, []);
 
   // Issue 9: 暗色模式
   const [darkMode, setDarkMode] = useState(() => {
@@ -32,23 +43,31 @@ export default function App() {
     localStorage.setItem("novel-dark", darkMode);
   }, [darkMode]);
 
-  // 启动时检查 API Key
+  // 启动时先恢复 HttpOnly Cookie 会话，再加载用户可访问的项目。
   useEffect(() => {
-    api.checkSetupStatus().then((s) => {
-      if (!s.llm_configured) {
-        setSettingsOpen(true);
-      } else {
-        setLlmReady(true);
-      }
-    }).catch(() => setLlmReady(true));
-    loadJobs().finally(() => setInitialLoading(false));
-  }, []);
+    let cancelled = false;
+    api.authStatus().then(async (status) => {
+      if (cancelled) return;
+      setAuthInitialized(status.initialized);
+      setUser(status.user || null);
+      if (!status.authenticated) return;
+      const setup = await api.checkSetupStatus().catch(() => ({ llm_configured: true }));
+      if (!setup.llm_configured) setSettingsOpen(true);
+      else setLlmReady(true);
+      await loadJobs();
+    }).finally(() => {
+      if (!cancelled) setInitialLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [loadJobs]);
 
-  const loadJobs = async () => {
-    try {
-      const list = await api.listJobs();
-      setJobs(list);
-    } catch (_) {}
+  const handleAuthenticated = async (authenticatedUser) => {
+    setUser(authenticatedUser);
+    setAuthInitialized(true);
+    const setup = await api.checkSetupStatus().catch(() => ({ llm_configured: true }));
+    if (!setup.llm_configured) setSettingsOpen(true);
+    else setLlmReady(true);
+    await loadJobs();
   };
 
   const handleJobCreated = async (jobId) => {
@@ -66,7 +85,7 @@ export default function App() {
     setCurrentJobId(null);
     setDraftOutline(null);
     loadJobs();
-  }, []);
+  }, [loadJobs]);
 
   const handleSelectJob = async (jobId) => {
     setCurrentJobId(jobId);
@@ -111,6 +130,10 @@ export default function App() {
     );
   }
 
+  if (!user) {
+    return <AuthPanel initialized={authInitialized} onAuthenticated={handleAuthenticated} />;
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 transition-colors duration-200">
       {/* 顶部导航 */}
@@ -134,6 +157,14 @@ export default function App() {
               title={darkMode ? "切换亮色模式" : "切换暗色模式"}
             >
               {darkMode ? "☀️" : "🌙"}
+            </button>
+            <span className="text-xs text-gray-400" title={user.role}>{user.username}</span>
+            <button
+              onClick={async () => { await api.logout(); setUser(null); setJobs([]); }}
+              className="text-sm text-gray-500 hover:text-gray-800 dark:hover:text-gray-300 cursor-pointer transition"
+              title="退出登录"
+            >
+              退出
             </button>
             <button
               onClick={() => setSettingsOpen(true)}
@@ -167,7 +198,9 @@ export default function App() {
                             try {
                               await api.deleteJob(j.id);
                               await loadJobs();
-                            } catch (_) {}
+                            } catch {
+                              // 删除失败时保留任务，用户可稍后重试。
+                            }
                           }
                         }}
                         className="ml-2 opacity-0 group-hover/item:opacity-100 text-xs text-red-400 hover:text-red-600 transition cursor-pointer flex-shrink-0"

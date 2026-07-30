@@ -15,11 +15,15 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
+    llm_fast_model: str = ""
+    llm_quality_model: str = ""
     llm_temperature: float = 0.8
     llm_context_window: int = 1000000
+    llm_input_cost_per_million: float = 0.5
+    llm_output_cost_per_million: float = 2.0
 
-    # Admin auth
-    admin_token: str = "novel-agent-2026"
+    # Durable worker. Disable in API replicas when running `python -m app.worker`.
+    task_worker_enabled: bool = True
 
     # Database（支持通过环境变量覆盖，测试用）
     database_path: str = os.environ.get(
@@ -54,6 +58,10 @@ def get_llm_config() -> dict:
         "base_url": _runtime_llm["base_url"] or settings.llm_base_url,
         "api_key": _runtime_llm["api_key"] or settings.llm_api_key,
         "model": _runtime_llm["model"] or settings.llm_model,
+        "fast_model": settings.llm_fast_model or _runtime_llm["model"] or settings.llm_model,
+        "quality_model": settings.llm_quality_model or _runtime_llm["model"] or settings.llm_model,
+        "input_cost_per_million": settings.llm_input_cost_per_million,
+        "output_cost_per_million": settings.llm_output_cost_per_million,
         # 修复 temperature=0 被吞值：用 is not None 判断而非 or
         "temperature": (_runtime_llm["temperature"] if _runtime_llm["temperature"] is not None
                         else settings.llm_temperature),

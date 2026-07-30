@@ -6,14 +6,15 @@ from app.services.llm_adapter import LLMAdapter
 from app.services.llm_cache import get_cached, set_cache
 from app.config import get_llm_config
 from app.models import SetupCreate
+from app.services.story_bible import format_setup_context
 
 logger = logging.getLogger("novel_agent.outline")
 
-# 每批最多生成多少章（避免单次输出被截断）
-_BATCH_SIZE = 50
+# 结构化章节卡字段较多，缩小批次避免长大纲输出被截断。
+_BATCH_SIZE = 10
 
 
-OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据以下创作设定，为小说生成一份完整的大纲。
+OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据以下创作设定，为小说生成一份可直接指导正文写作的结构化大纲。
 
 ## 创作设定
 - 题材：{theme}
@@ -22,22 +23,35 @@ OUTLINE_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请根据
 {optional_fields}
 
 ## 要求
-1. 生成共 {chapter_count} 个章节的大纲
-2. 每个章节包含：章节序号 (1-based)、标题、情节摘要（50-150字）
-3. 大纲应有起承转合的结构，情节有推进感
-4. 标题要有吸引力
-5. 输出必须是 JSON 格式
+1. 生成共 {chapter_count} 个章节，形成清晰的起承转合和人物成长弧
+2. 每章必须给出标题、摘要、POV人物、地点、章节目标、核心冲突、转折和结尾钩子
+3. 标明出场人物、本章埋下/回收的伏笔，并拆成 1-4 个场景
+4. 所有内容严格遵守小说圣经，情节必须推进，避免重复事件
+5. 只输出 JSON
 
 ## 输出格式
 {{
   "chapters": [
-    {{"chapter_number": 1, "title": "第一章标题", "summary": "本章情节摘要"}},
-    ...
+    {{
+      "chapter_number": 1,
+      "title": "章节标题",
+      "summary": "50-150字情节摘要",
+      "pov_character": "视角人物",
+      "location": "主要地点",
+      "chapter_goal": "本章叙事目标",
+      "conflict": "核心冲突",
+      "turning_point": "关键转折",
+      "ending_hook": "结尾悬念或情绪落点",
+      "characters": ["人物名"],
+      "foreshadowing_add": ["本章新伏笔"],
+      "foreshadowing_resolve": ["本章回收伏笔"],
+      "scenes": [{{"goal": "场景目标", "conflict": "场景阻碍", "result": "场景结果"}}]
+    }}
   ]
 }}
 """
 
-BATCH_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请为小说的第 {start}-{end} 章生成大纲。
+BATCH_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请生成小说第 {start}-{end} 章的结构化章节卡。
 
 ## 创作设定
 - 题材：{theme}
@@ -47,24 +61,16 @@ BATCH_PROMPT_TEMPLATE = """你是一位专业小说大纲策划师。请为小�
 ## 前文大纲概要
 {previous_batch_summary}
 
-## 本章节范围
-- 章节序号：第 {start} 章 到 第 {end} 章
-- 这是整个大系列中的第 {batch_index}/{total_batches} 批
+## 范围
+- 第 {start} 章到第 {end} 章，共 {count} 章
+- 当前为第 {batch_index}/{total_batches} 批
 
 ## 要求
-1. 生成从第 {start} 章到第 {end} 章的大纲，共 {count} 章
-2. 每个章节包含：章节序号 (1-based)、标题、情节摘要（50-150字）
-3. 情节要有推进感，与前文连贯
-4. 标题要有吸引力
-5. 输出必须是 JSON 格式
-
-## 输出格式
-{{
-  "chapters": [
-    {{"chapter_number": {start}, "title": "第{start}章标题", "summary": "本章情节摘要"}},
-    ...
-  ]
-}}
+1. 章节编号必须从 {start} 连续到 {end}
+2. 每章必须包含 title、summary、pov_character、location、chapter_goal、conflict、turning_point、ending_hook
+3. 每章必须包含 characters、foreshadowing_add、foreshadowing_resolve 数组和 scenes 场景数组
+4. scenes 每项包含 goal、conflict、result；保持与前文连贯并推进长期主线
+5. 严格遵守小说圣经，只输出 JSON 对象：{{"chapters": [...]}}
 """
 
 
@@ -102,16 +108,7 @@ def build_batch_prompt(
 
 
 def _build_optional_lines(setup: SetupCreate) -> str:
-    lines = []
-    if setup.writing_style:
-        lines.append(f"- 写作风格：{setup.writing_style}")
-    if setup.characters:
-        lines.append(f"- 主要人物：{', '.join(setup.characters)}")
-    if setup.world_setting:
-        lines.append(f"- 世界观设定：{setup.world_setting}")
-    if setup.narrative_perspective:
-        lines.append(f"- 叙事视角：{setup.narrative_perspective}")
-    return "\n".join(lines) if lines else ""
+    return format_setup_context(setup)
 
 
 async def generate_outline_stream(
@@ -142,10 +139,13 @@ async def generate_outline_stream(
 
     # 尝试全量缓存
     full_prompt = build_outline_prompt(setup)
-    cached = get_cached(full_prompt, cfg["model"])
+    cached = get_cached(
+        full_prompt, cfg["quality_model"], category="outline", prompt_version="2.0.0",
+    )
     if cached:
         chapters = json.loads(cached)
         if len(chapters) == total:
+            chapters = _normalize_outline_chapters(chapters, total)
             logger.info(f"全量缓存命中: {len(chapters)} 章")
             await publish_func("outline_done", outline=chapters, message="大纲生成成功（缓存）")
             return chapters
@@ -184,7 +184,10 @@ async def generate_outline_stream(
 
     # 全部完成，缓存全量
     if len(all_chapters) == total:
-        set_cache(full_prompt, cfg["model"], json.dumps(all_chapters, ensure_ascii=False))
+        set_cache(
+            full_prompt, cfg["quality_model"], json.dumps(all_chapters, ensure_ascii=False),
+            category="outline", prompt_version="2.0.0",
+        )
 
     await publish_func("outline_done", outline=all_chapters,
                        message=f"大纲生成成功（共{batch_no}批，{len(all_chapters)}章）")
@@ -212,11 +215,14 @@ async def _generate_single_batch(
 
     # 尝试批缓存
     batch_cache_key = f"{prompt}::batch"
-    cached = get_cached(batch_cache_key, cfg["model"])
+    cached = get_cached(
+        batch_cache_key, cfg["quality_model"], category="outline", prompt_version="2.0.0",
+    )
     if cached:
         chapters = json.loads(cached)
         expected = end - start + 1
         if len(chapters) == expected and chapters[0]["chapter_number"] == start:
+            chapters = _normalize_outline_chapters(chapters, expected)
             logger.info(f"第{batch_no}批缓存命中: {len(chapters)}章")
             return chapters
 
@@ -248,7 +254,10 @@ async def _generate_single_batch(
         # 缓存该批
         expected = end - start + 1
         if len(chapters) == expected:
-            set_cache(batch_cache_key, cfg["model"], json.dumps(chapters, ensure_ascii=False))
+            set_cache(
+                batch_cache_key, cfg["quality_model"], json.dumps(chapters, ensure_ascii=False),
+                category="outline", prompt_version="2.0.0",
+            )
 
     return chapters
 
@@ -260,7 +269,7 @@ async def llm_stream_with_fallback(messages, max_tokens=8192):
     1. 普通流式（某些 API 不支持 JSON mode 流式转空）
     2. 非流式 JSON mode
     """
-    llm = LLMAdapter()
+    llm = LLMAdapter(purpose="outline.generate", prompt_id="outline.generate", job_id=None)
     chunks = []
     # 先试普通流式
     try:
@@ -273,7 +282,10 @@ async def llm_stream_with_fallback(messages, max_tokens=8192):
     # 普通流式空内容 → JSON mode 非流式
     if not chunks:
         logger.warning("流式为空，降级到非流式 JSON mode")
-        result = await LLMAdapter().chat_json(messages, max_tokens=max_tokens)
+        result = await llm.chat_json(
+            messages, max_tokens=max_tokens,
+            purpose="outline.generate", prompt_id="outline.generate",
+        )
         yield json.dumps(result, ensure_ascii=False)
 
 
@@ -281,76 +293,105 @@ async def generate_outline(setup: SetupCreate) -> list[dict]:
     """非流式生成大纲（兜底用）"""
     cfg = get_llm_config()
     full_prompt = build_outline_prompt(setup)
-    cached = get_cached(full_prompt, cfg["model"])
+    cached = get_cached(
+        full_prompt, cfg["quality_model"], category="outline", prompt_version="2.0.0",
+    )
     if cached:
         chapters = json.loads(cached)
         if len(chapters) == setup.chapter_count:
-            return chapters
+            return _normalize_outline_chapters(chapters, setup.chapter_count)
 
     logger.info(f"非流式生成大纲: theme={setup.theme} chapters={setup.chapter_count}")
     messages = [
         {"role": "system", "content": "你是一位创意写作助手，擅长为小说设计结构完整的大纲。请始终输出 JSON。"},
         {"role": "user", "content": full_prompt},
     ]
-    result = await LLMAdapter().chat_json(messages, max_tokens=8192)
+    result = await LLMAdapter(
+        purpose="outline.generate", prompt_id="outline.generate",
+    ).chat_json(messages, max_tokens=8192)
     chapters = _parse_outline_json(json.dumps(result, ensure_ascii=False), setup.chapter_count)
     return chapters
 
 
+def _normalize_outline_chapters(chapters: list, expected_count: int) -> list[dict]:
+    """补齐结构化章节卡字段，使旧缓存和旧模型输出继续可用。"""
+    string_fields = (
+        "pov_character", "location", "chapter_goal", "conflict",
+        "turning_point", "ending_hook",
+    )
+    list_fields = ("characters", "foreshadowing_add", "foreshadowing_resolve")
+    normalized = []
+    for chapter in chapters[:expected_count]:
+        if not isinstance(chapter, dict) or not all(
+            key in chapter for key in ("chapter_number", "title", "summary")
+        ):
+            continue
+        item = dict(chapter)
+        for field in string_fields:
+            item[field] = item.get(field) or ""
+        for field in list_fields:
+            value = item.get(field, [])
+            item[field] = value if isinstance(value, list) else [str(value)]
+        scenes = item.get("scenes", [])
+        item["scenes"] = [
+            {
+                "goal": scene.get("goal", ""),
+                "conflict": scene.get("conflict", ""),
+                "result": scene.get("result", ""),
+            }
+            for scene in scenes if isinstance(scene, dict)
+        ] if isinstance(scenes, list) else []
+        normalized.append(item)
+    return normalized
+
+
 def _parse_outline_json(raw: str, expected_count: int) -> list[dict]:
-    """从原始 JSON 文本中解析大纲章节列表"""
+    """从原始 JSON 文本中解析并标准化大纲章节列表。"""
     if not raw or not raw.strip():
         logger.warning("大纲内容为空")
         return []
 
-    # 尝试直接解析
     try:
         data = json.loads(raw)
         chapters = data.get("chapters", [])
         if chapters:
             logger.info(f"直接解析成功: {len(chapters)} 章")
-            return chapters[:expected_count]
+            return _normalize_outline_chapters(chapters, expected_count)
     except json.JSONDecodeError:
         pass
 
-    # 尝试从流式片段中提取 JSON
     patterns = [
         r'\{[\s\S]*?"chapters"[\s\S]*?\}',
         r'```json\s*([\s\S]*?)```',
         r'```\s*([\s\S]*?)```',
     ]
     for pattern in patterns:
-        m = re.search(pattern, raw)
-        if m:
-            candidate = m.group(1) if m.lastindex else m.group(0)
-            try:
-                data = json.loads(candidate)
-                chapters = data.get("chapters", [])
-                if chapters:
-                    logger.info(f"正则提取解析成功: {len(chapters)} 章")
-                    return chapters[:expected_count]
-            except json.JSONDecodeError:
-                continue
+        match = re.search(pattern, raw)
+        if not match:
+            continue
+        candidate = match.group(1) if match.lastindex else match.group(0)
+        try:
+            chapters = json.loads(candidate).get("chapters", [])
+            if chapters:
+                logger.info(f"正则提取解析成功: {len(chapters)} 章")
+                return _normalize_outline_chapters(chapters, expected_count)
+        except json.JSONDecodeError:
+            continue
 
-    # Fallback: 截取最外层 {}
     start = raw.find("{")
     end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = raw[start:end + 1]
+    if start != -1 and end > start:
         try:
-            data = json.loads(candidate)
-            chapters = data.get("chapters", [])
+            chapters = json.loads(raw[start:end + 1]).get("chapters", [])
             if chapters:
-                return chapters[:expected_count]
+                return _normalize_outline_chapters(chapters, expected_count)
         except json.JSONDecodeError:
             pass
 
-    # Fallback: 逐条提取完整的 chapter 对象（截断恢复）
     chapters = _extract_chapters_from_truncated(raw)
     if chapters:
         logger.info(f"截断恢复成功: 提取到 {len(chapters)} 章")
-        return chapters[:expected_count]
-
+        return _normalize_outline_chapters(chapters, expected_count)
     return []
 
 

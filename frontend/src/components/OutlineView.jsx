@@ -14,14 +14,23 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
   const [streamText, setStreamText] = useState("");
   const [streamProgress, setStreamProgress] = useState("");
   const [batchInfo, setBatchInfo] = useState(null); // {batch, total_batches, batch_start, batch_end}
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     mountedRef.current = true;
-    if (!initialOutline && jobId && !generating) {
-      // 不自动触发，等用户点击
-    }
     return () => { mountedRef.current = false; };
   }, [jobId]);
+
+  useEffect(() => {
+    const warnBeforeUnload = (event) => {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [dirty]);
 
   // SSE 监听大纲生成事件
   useSSE(jobId, (event, data) => {
@@ -32,10 +41,11 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
         setBatchInfo({ batch: data.batch, total: data.total_batches, start: data.batch_start, end: data.batch_end });
       }
     } else if (event === "outline_token") {
-      setStreamText(data.accumulated || streamText + data.text);
+      if (data.accumulated !== undefined) setStreamText(data.accumulated);
+      else setStreamText((current) => current + (data.text || ""));
     } else if (event === "outline_done") {
-      // 大纲生成完成
       setOutline(data.outline || []);
+      setDirty(false);
       setGenerating(false);
       setStreamText("");
       setStreamProgress("");
@@ -57,7 +67,7 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
     setStreamText("");
     setStreamProgress("正在请求 AI 生成大纲...");
     try {
-      const data = await api.generateOutline(jobId);
+      await api.generateOutline(jobId);
       // 返回后不代表完成，等待 SSE 事件
       setModifyMsg("大纲正在生成中...");
     } catch (err) {
@@ -82,7 +92,8 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
     try {
       const data = await api.modifyOutline(jobId, modifyInstr);
       setOutline(data.outline);
-      setModifyMsg("✅ 大纲已更新");
+      setDirty(false);
+      setModifyMsg("✅ 大纲已更新并保存");
       setModifyInstr("");
     } catch (err) {
       setModifyMsg("❌ " + err.message);
@@ -91,9 +102,28 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
     }
   };
 
+  const persistOutline = async () => {
+    if (!outline.length) return false;
+    setSaving(true);
+    setModifyMsg("");
+    try {
+      const data = await api.saveOutline(jobId, outline);
+      setOutline(data.outline);
+      setDirty(false);
+      setModifyMsg("✅ 大纲已保存");
+      return true;
+    } catch (err) {
+      setModifyMsg("❌ 保存失败：" + err.message);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleConfirm = async () => {
     setLoading(true);
     try {
+      if (dirty && !(await persistOutline())) return;
       await api.confirmOutline(jobId);
       onConfirm();
     } catch (err) {
@@ -103,33 +133,63 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
     }
   };
 
+  const handleBack = () => {
+    if (dirty && !window.confirm("大纲还有未保存的修改，确定离开吗？")) return;
+    onBack();
+  };
+
   // 本地编辑某个章节
   const updateChapter = (idx, field, value) => {
     const updated = [...outline];
     updated[idx] = { ...updated[idx], [field]: value };
     setOutline(updated);
+    setDirty(true);
+  };
+
+  const updateListField = (idx, field, value) => {
+    updateChapter(idx, field, value.split(/[,，、]/).map((item) => item.trim()).filter(Boolean));
+  };
+
+  const updateScenes = (idx, value) => {
+    const scenes = value.split("\n").map((line) => {
+      const [goal = "", conflict = "", result = ""] = line.split("|").map((item) => item.trim());
+      return { goal, conflict, result };
+    }).filter((scene) => scene.goal || scene.conflict || scene.result);
+    updateChapter(idx, "scenes", scenes);
   };
 
   return (
     <div className="max-w-4xl mx-auto py-8 px-4">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <button onClick={onBack} className="text-sm text-indigo-600 hover:text-indigo-800 cursor-pointer">
+          <button onClick={handleBack} className="text-sm text-indigo-600 hover:text-indigo-800 cursor-pointer">
             ← 返回任务列表
           </button>
           <h2 className="text-xl font-bold text-gray-900 mt-1">📋 作品大纲</h2>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          {outline.length > 0 && (
+            <span className={`text-xs px-2 py-1 rounded-full ${dirty ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
+              {saving ? "保存中..." : dirty ? "● 未保存" : "✓ 已保存"}
+            </span>
+          )}
           <button
             onClick={loadOutline}
-            disabled={generating}
+            disabled={generating || saving}
             className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
           >
             {generating ? "⏳ 生成中..." : "🔄 生成大纲"}
           </button>
           <button
+            onClick={persistOutline}
+            disabled={loading || saving || generating || !dirty}
+            className="px-4 py-2 text-sm border border-indigo-200 text-indigo-700 rounded-lg hover:bg-indigo-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            {saving ? "保存中..." : "💾 保存大纲"}
+          </button>
+          <button
             onClick={handleConfirm}
-            disabled={loading || generating || outline.length === 0}
+            disabled={loading || saving || generating || outline.length === 0}
             className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm rounded-lg font-medium transition cursor-pointer"
           >
             {loading ? "处理中..." : "✅ 确认大纲，开始写正文"}
@@ -190,14 +250,37 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
                 <input
                   value={ch.title}
                   onChange={(e) => updateChapter(i, "title", e.target.value)}
-                  className="w-full font-medium text-gray-900 bg-transparent border-b border-transparent hover:border-gray-200 focus:border-indigo-500 outline-none transition"
+                  className="w-full font-medium text-gray-900 dark:text-gray-100 bg-transparent border-b border-transparent hover:border-gray-200 focus:border-indigo-500 outline-none transition"
                 />
                 <textarea
                   value={ch.summary}
                   onChange={(e) => updateChapter(i, "summary", e.target.value)}
                   rows={2}
-                  className="w-full mt-1 text-sm text-gray-500 bg-transparent border border-transparent hover:border-gray-100 focus:border-indigo-200 rounded outline-none transition resize-none p-1"
+                  className="w-full mt-1 text-sm text-gray-500 dark:text-gray-400 bg-transparent border border-transparent hover:border-gray-100 focus:border-indigo-200 rounded outline-none transition resize-none p-1"
                 />
+                <details className="mt-2 text-sm">
+                  <summary className="cursor-pointer text-indigo-600 select-none">
+                    结构化章节卡
+                    {ch.pov_character && <span className="ml-2 text-xs text-gray-400">POV：{ch.pov_character}</span>}
+                  </summary>
+                  <div className="mt-3 grid md:grid-cols-2 gap-3 rounded-lg bg-gray-50 dark:bg-gray-800 p-3">
+                    <input value={ch.pov_character || ""} onChange={(e) => updateChapter(i, "pov_character", e.target.value)} placeholder="POV 人物" className="px-3 py-2 border rounded-lg dark:bg-gray-700 dark:border-gray-600" />
+                    <input value={ch.location || ""} onChange={(e) => updateChapter(i, "location", e.target.value)} placeholder="主要地点" className="px-3 py-2 border rounded-lg dark:bg-gray-700 dark:border-gray-600" />
+                    {[
+                      ["chapter_goal", "本章目标"], ["conflict", "核心冲突"],
+                      ["turning_point", "关键转折"], ["ending_hook", "结尾钩子"],
+                    ].map(([field, label]) => <textarea key={field} value={ch[field] || ""} onChange={(e) => updateChapter(i, field, e.target.value)} rows={2} placeholder={label} className="px-3 py-2 border rounded-lg resize-y dark:bg-gray-700 dark:border-gray-600" />)}
+                    <input value={(ch.characters || []).join("、")} onChange={(e) => updateListField(i, "characters", e.target.value)} placeholder="出场人物，使用逗号分隔" className="px-3 py-2 border rounded-lg dark:bg-gray-700 dark:border-gray-600" />
+                    <input value={(ch.foreshadowing_add || []).join("、")} onChange={(e) => updateListField(i, "foreshadowing_add", e.target.value)} placeholder="本章埋下的伏笔" className="px-3 py-2 border rounded-lg dark:bg-gray-700 dark:border-gray-600" />
+                    <input value={(ch.foreshadowing_resolve || []).join("、")} onChange={(e) => updateListField(i, "foreshadowing_resolve", e.target.value)} placeholder="本章回收的伏笔" className="px-3 py-2 border rounded-lg dark:bg-gray-700 dark:border-gray-600" />
+                    <textarea
+                      value={(ch.scenes || []).map((scene) => `${scene.goal || ""} | ${scene.conflict || ""} | ${scene.result || ""}`).join("\n")}
+                      onChange={(e) => updateScenes(i, e.target.value)} rows={3}
+                      placeholder="场景规划：目标 | 冲突 | 结果（每行一个场景）"
+                      className="md:col-span-2 px-3 py-2 border rounded-lg resize-y dark:bg-gray-700 dark:border-gray-600"
+                    />
+                  </div>
+                </details>
               </div>
             </div>
           </div>
