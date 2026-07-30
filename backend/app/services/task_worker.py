@@ -126,6 +126,10 @@ class TaskWorker:
         if not outline:
             raise RuntimeError("生成的大纲为空")
         await jobs.save_outline(job.id, outline)
+        await publish(
+            job.id, "outline_done", outline=outline,
+            message=f"大纲生成成功（共 {len(outline)} 章）",
+        )
 
     async def _generate_chapters(self, task: dict) -> None:
         from app.services.chapter_generator import generate_chapters

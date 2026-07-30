@@ -33,6 +33,7 @@ async def stream_progress(job_id: str):
                     "status": job.status,
                     "current_chapter": job.current_chapter,
                     "chapter_count": job.chapter_count,
+                    "outline_ready": bool(job.outline),
                     "completed_count": len(completed),
                     "chapters": [
                         {"chapter_number": c["chapter_number"],

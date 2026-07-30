@@ -111,7 +111,7 @@ async def assist_setup(setup: SetupCreate):
 现有小说圣经：{json.dumps(current, ensure_ascii=False)}
 
 返回 JSON 对象，顶层键必须为 story_bible。story_bible 必须包含：target_audience、tone、core_conflict、theme_expression、selling_points、prohibited_content、character_profiles、character_relationships、world_summary、world_rules、factions、power_system、main_plot、subplots、foreshadowing、key_items、locations。
-character_profiles 每项包含 name、role、identity、personality、goal、internal_need、secret、arc、speech_style。数组内容应具体、简洁、可直接指导后续写作；保留用户已有设定，不要输出解释。"""
+character_profiles 每项包含 name、role、identity、personality、goal、internal_need、secret、arc、speech_style。factions 必须是字符串数组，每项使用“势力名称：势力描述”格式，不要返回对象。其他数组字段也必须返回字符串数组。数组内容应具体、简洁、可直接指导后续写作；保留用户已有设定，不要输出解释。"""
     try:
         result = await LLMAdapter(
             purpose="story_bible.assist", prompt_id="story_bible.assist",

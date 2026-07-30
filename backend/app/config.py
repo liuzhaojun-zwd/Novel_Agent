@@ -9,6 +9,8 @@ from pydantic_settings import BaseSettings
 from pathlib import Path
 from typing import Optional
 
+APP_ROOT = Path(__file__).resolve().parent.parent
+
 
 class Settings(BaseSettings):
     # LLM API
@@ -25,10 +27,8 @@ class Settings(BaseSettings):
     # Durable worker. Disable in API replicas when running `python -m app.worker`.
     task_worker_enabled: bool = True
 
-    # Database（支持通过环境变量覆盖，测试用）
-    database_path: str = os.environ.get(
-        "NOVEL_AGENT_DB_PATH", "data/novel_agent.db"
-    )
+    # Database（相对路径也固定相对于 backend 目录，避免启动目录变化导致多份数据库）
+    database_path: str = str(APP_ROOT / "data" / "novel_agent.db")
 
     # Server
     host: str = "0.0.0.0"
@@ -42,6 +42,11 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# .env 中的相对 DATABASE_PATH/NOVEL_AGENT_DB_PATH 统一相对于 backend 目录解析。
+_configured_database_path = Path(settings.database_path)
+if not _configured_database_path.is_absolute():
+    settings.database_path = str(APP_ROOT / _configured_database_path)
 
 # 运行时动态配置（前端可覆盖，重启后丢失）
 _runtime_llm = {

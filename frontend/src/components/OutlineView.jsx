@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { api } from "../api";
 import { useSSE } from "../hooks/useSSE";
 
@@ -17,10 +17,42 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  const recoverPersistedOutline = useCallback(async (message = "") => {
+    try {
+      const job = await api.getJob(jobId);
+      if (job.status !== "pending" || !job.outline?.length || !mountedRef.current) return false;
+      setOutline(job.outline);
+      setDirty(false);
+      setGenerating(false);
+      setStreamText("");
+      setStreamProgress("");
+      setBatchInfo(null);
+      if (message) setModifyMsg(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [jobId]);
+
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
-  }, [jobId]);
+    const timer = window.setTimeout(() => {
+      recoverPersistedOutline("✅ 已恢复保存的大纲");
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      mountedRef.current = false;
+    };
+  }, [recoverPersistedOutline]);
+
+  // SSE 事件可能因断线或独立 Worker 丢失；生成期间以数据库状态兜底。
+  useEffect(() => {
+    if (!generating) return undefined;
+    const timer = window.setInterval(() => {
+      recoverPersistedOutline("✅ 大纲生成成功（已从数据库同步）");
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [generating, recoverPersistedOutline]);
 
   useEffect(() => {
     const warnBeforeUnload = (event) => {
@@ -34,7 +66,14 @@ export default function OutlineView({ jobId, onConfirm, outline: initialOutline,
 
   // SSE 监听大纲生成事件
   useSSE(jobId, (event, data) => {
-    if (event === "outline_progress") {
+    if (event === "initial_state") {
+      if (data.outline_ready) {
+        recoverPersistedOutline("✅ 大纲已生成并恢复");
+      } else if (data.status === "generating_outline") {
+        setGenerating(true);
+        setStreamProgress("大纲正在生成中...");
+      }
+    } else if (event === "outline_progress") {
       setStreamProgress(data.message || "生成中...");
       setGenerating(true);
       if (data.batch) {

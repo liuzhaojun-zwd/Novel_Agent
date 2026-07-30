@@ -27,8 +27,8 @@ async def lifespan(app: FastAPI):
     await init_http_client()
     cfg = get_llm_config()
     logger.info(
-        "service_started model=%s fast_model=%s quality_model=%s base_url=%s",
-        cfg["model"], cfg["fast_model"], cfg["quality_model"], cfg["base_url"],
+        "service_started model=%s fast_model=%s quality_model=%s base_url=%s database=%s",
+        cfg["model"], cfg["fast_model"], cfg["quality_model"], cfg["base_url"], settings.database_path,
     )
     worker = TaskWorker() if settings.task_worker_enabled else None
     try:

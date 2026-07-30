@@ -6,7 +6,7 @@ async function request(path, options = {}) {
   try {
     res = await fetch(`${BASE}${path}`, { credentials: "include", ...options, headers });
   } catch (error) {
-    throw new Error(`无法连接服务，请检查后端是否运行（${error.message}）`);
+    throw new Error(`无法连接服务，请检查后端是否运行（${error.message}）`, { cause: error });
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));

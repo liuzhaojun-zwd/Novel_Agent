@@ -1,7 +1,7 @@
 """Novel_Agent — Pydantic 数据模型（请求/响应定义）"""
 
 from __future__ import annotations
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional
 from uuid import uuid4
 from datetime import datetime
@@ -36,6 +36,22 @@ class StoryBible(BaseModel):
     world_rules: list[str] = Field(default_factory=list)
     factions: list[str] = Field(default_factory=list)
     power_system: str = ""
+
+    @field_validator("factions", mode="before")
+    @classmethod
+    def normalize_factions(cls, value):
+        """兼容模型返回的 {name, description} 势力对象。"""
+        if not isinstance(value, list):
+            return value
+        normalized = []
+        for faction in value:
+            if isinstance(faction, dict) and "name" in faction:
+                name = str(faction.get("name") or "").strip()
+                description = str(faction.get("description") or "").strip()
+                normalized.append(f"{name}：{description}" if name and description else name)
+            else:
+                normalized.append(faction)
+        return normalized
     main_plot: str = ""
     subplots: list[str] = Field(default_factory=list)
     foreshadowing: list[str] = Field(default_factory=list)

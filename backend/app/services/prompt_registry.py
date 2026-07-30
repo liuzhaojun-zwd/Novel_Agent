@@ -6,9 +6,9 @@ import hashlib
 import json
 
 PROMPT_VERSIONS = {
-    "outline.generate": "2.0.0",
+    "outline.generate": "2.1.0",
     "outline.edit": "2.0.0",
-    "story_bible.assist": "1.0.0",
+    "story_bible.assist": "1.1.0",
     "chapter.plan": "1.0.0",
     "chapter.draft": "1.0.0",
     "chapter.polish": "1.0.0",
